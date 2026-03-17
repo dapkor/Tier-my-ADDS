@@ -303,10 +303,170 @@ function Set-LAPSGPO {
     Write-Log "  LAPS (WindowsLAPS=$UseWindowsLAPS) -> '$GPOName'" OK
 }
 
-function Set-ADDelegation {
+function Invoke-Phase {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Block
+    )
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-Log "=== PHASE START: $Name ===" INFO
+    try {
+        & $Block
+        $sw.Stop()
+        Write-Log "=== PHASE COMPLETE: $Name ($($sw.Elapsed.ToString())) ===" OK
+    }
+    catch {
+        $sw.Stop()
+        Write-Log "=== PHASE FAILED: $Name ($($sw.Elapsed.ToString())) ===" ERROR
+        throw
+    }
+}
+
+function Get-OUPathForZone {
+    param(
+        [Parameter(Mandatory)][string]$TierNum,
+        [Parameter(Mandatory)][string]$ZoneKey,
+        [Parameter(Mandatory)][string]$CorpBaseOU,
+        [string]$ChildDNPrefix
+    )
+
+    $base = "OU=Zone $ZoneKey,OU=Tier $TierNum,OU=Tiers,$CorpBaseOU"
+    if ([string]::IsNullOrWhiteSpace($ChildDNPrefix)) { return $base }
+    return "$ChildDNPrefix,$base"
+}
+
+function Set-DenyLogonRightsBaseline {
+    param(
+        [Parameter(Mandatory)][string]$GPOName,
+        [Parameter(Mandatory)][string[]]$GroupSamNames,
+        [string[]]$NetworkGroupSamNames = $GroupSamNames,
+        [switch]$IncludeNetwork = $true,
+        [switch]$IncludeBatch = $true,
+        [switch]$IncludeService = $true
+    )
+
+    Set-GPOUserRight $GPOName 'SeDenyInteractiveLogonRight' $GroupSamNames
+    Set-GPOUserRight $GPOName 'SeDenyRemoteInteractiveLogonRight' $GroupSamNames
+    if ($IncludeNetwork) {
+        Set-GPOUserRight $GPOName 'SeDenyNetworkLogonRight' $NetworkGroupSamNames
+    }
+    if ($IncludeBatch) {
+        Set-GPOUserRight $GPOName 'SeDenyBatchLogonRight' $GroupSamNames
+    }
+    if ($IncludeService) {
+        Set-GPOUserRight $GPOName 'SeDenyServiceLogonRight' $GroupSamNames
+    }
+}
+
+function Assert-Config {
+    param([hashtable]$Cfg)
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $warnings = New-Object System.Collections.Generic.List[string]
+
+    if (-not $Cfg.ContainsKey('Zones') -or -not $Cfg.Zones) {
+        $errors.Add('Config.Zones is missing or empty.')
+    }
+
+    $validZoneMap = @{}
+    foreach ($tierName in @('T0','T1','T2')) {
+        if (-not $Cfg.Zones.ContainsKey($tierName)) {
+            $errors.Add("Config.Zones missing tier '$tierName'.")
+            continue
+        }
+        foreach ($zoneKey in $Cfg.Zones[$tierName].Keys) {
+            if ($zoneKey -notmatch '^[0-2][A-Z]$') {
+                $errors.Add("Zone key '$zoneKey' is invalid. Expected format like 0A, 1C, 2B.")
+                continue
+            }
+            if (-not $zoneKey.StartsWith($tierName.Substring(1))) {
+                $errors.Add("Zone '$zoneKey' does not match tier '$tierName'.")
+            }
+            $validZoneMap[$zoneKey] = $true
+        }
+    }
+
+    foreach ($zoneKey in $Cfg.ZoneServices.Keys) {
+        if (-not $validZoneMap.ContainsKey($zoneKey)) {
+            $errors.Add("ZoneServices contains '$zoneKey' but it is not defined under Config.Zones.")
+        }
+        $services = @($Cfg.ZoneServices[$zoneKey])
+        if ($services.Count -eq 0) {
+            $errors.Add("ZoneServices '$zoneKey' has no services configured.")
+            continue
+        }
+        $seen = @{}
+        foreach ($svc in $services) {
+            if ([string]::IsNullOrWhiteSpace($svc)) {
+                $errors.Add("ZoneServices '$zoneKey' contains an empty service name.")
+                continue
+            }
+            $key = $svc.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) {
+                $errors.Add("ZoneServices '$zoneKey' contains duplicate service '$svc'.")
+            } else {
+                $seen[$key] = $true
+            }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Cfg.CorpOU)) {
+        $errors.Add('Config.CorpOU cannot be empty.')
+    }
+    if ([string]::IsNullOrWhiteSpace($Cfg.BreakGlass.Account1) -or [string]::IsNullOrWhiteSpace($Cfg.BreakGlass.Account2)) {
+        $errors.Add('BreakGlass.Account1 and BreakGlass.Account2 are required.')
+    }
+    if ($Cfg.BreakGlass.Account1 -eq $Cfg.BreakGlass.Account2) {
+        $errors.Add('BreakGlass.Account1 and BreakGlass.Account2 must be different accounts.')
+    }
+    if ($Cfg.DNS.Deploy -and [string]::IsNullOrWhiteSpace($Cfg.DNS.ServerName)) {
+        $errors.Add('DNS.Deploy=true requires DNS.ServerName.')
+    }
+    if ($Cfg.BreakGlass.TempPassword -like 'ChangeMe!*') {
+        $warnings.Add('Break-glass TempPassword appears to be a placeholder value.')
+    }
+    if ($Cfg.CreateTestAccounts) {
+        $warnings.Add('CreateTestAccounts=true will create test users with configured passwords.')
+    }
+
+    return [pscustomobject]@{
+        Errors = @($errors)
+        Warnings = @($warnings)
+    }
+}
+
+function Export-ValidationReport {
+    param(
+        [Parameter(Mandatory)][hashtable]$Report,
+        [string]$OutputDirectory = '.',
+        [string]$Prefix = 'MEAM-Compliance'
+    )
+
+    if (-not (Test-Path $OutputDirectory)) {
+        New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
+    }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $jsonPath = Join-Path $OutputDirectory "$Prefix-$stamp.json"
+    $csvPath  = Join-Path $OutputDirectory "$Prefix-$stamp.csv"
+
+    $rows = foreach ($k in $Report.Keys) {
+        [pscustomobject]@{ Check = $k; Result = [string]$Report[$k] }
+    }
+
+    $rows | ConvertTo-Json -Depth 4 | Set-Content -Path $jsonPath -Encoding UTF8
+    $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+    Write-Log "Validation report exported: $jsonPath" OK
+    Write-Log "Validation report exported: $csvPath" OK
+
+    return [pscustomobject]@{ JsonPath = $jsonPath; CsvPath = $csvPath }
+}
+
+function Add-ADDelegationSafe {
     <#
-    Sets an ACE on an AD OU for a delegation group.
-    Used extensively for the MEAM ~18-group-per-service delegation model.
+    Adds delegation ACEs only when an equivalent ACE does not already exist.
+    Keeps delegation idempotent across re-runs.
     #>
     param(
         [string]$TargetDN,
@@ -320,7 +480,6 @@ function Set-ADDelegation {
     $extRights = @{
         'ResetPassword'   = [System.Guid]'00299570-246d-11d0-a768-00aa006e0529'
         'ChangePassword'  = [System.Guid]'ab721a53-1e2f-11d0-9819-00aa0040529b'
-        'ReadLAPS'        = [System.Guid]'ms-mcs-admpwd'   # resolved dynamically below
     }
     $rightFlags = @{
         'ReadProperty'  = [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
@@ -338,7 +497,34 @@ function Set-ADDelegation {
     foreach ($r in $Rights) {
         $adRight = if ($rightFlags.ContainsKey($r)) { $rightFlags[$r] } else { [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty }
         $objType = if ($extRights.ContainsKey($r)) { $extRights[$r] } else { $ObjectType }
-        $ace     = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+
+        $exists = $false
+        foreach ($existingRule in $acl.Access) {
+            $existingSid = $null
+            try {
+                $existingSid = $existingRule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            }
+            catch {
+                $existingSid = [string]$existingRule.IdentityReference
+            }
+            if (
+                ($existingSid -eq $sid.Value) -and
+                ($existingRule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) -and
+                ($existingRule.ActiveDirectoryRights -eq $adRight) -and
+                ($existingRule.ObjectType -eq $objType) -and
+                ($existingRule.InheritanceType -eq $Inheritance) -and
+                ($existingRule.InheritedObjectType -eq $InheritedObjectType)
+            ) {
+                $exists = $true
+                break
+            }
+        }
+        if ($exists) {
+            Write-Log "  ACL exists: $GroupSam -> $r on $TargetDN (skipped)" INFO
+            continue
+        }
+
+        $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
             $sid, $adRight,
             [System.Security.AccessControl.AccessControlType]::Allow,
             $objType, $Inheritance, $InheritedObjectType
@@ -349,6 +535,24 @@ function Set-ADDelegation {
     Write-Log "  ACL: $GroupSam -> [$($Rights -join ',')] on $TargetDN" OK
 }
 
+function Set-ADDelegation {
+    <#
+    Backward-compatible wrapper for legacy calls.
+    #>
+    param(
+        [string]$TargetDN,
+        [string]$GroupSam,
+        [string[]]$Rights,
+        [System.Guid]$ObjectType           = [System.Guid]::Empty,
+        [System.Guid]$InheritedObjectType  = [System.Guid]::Empty,
+        [System.DirectoryServices.ActiveDirectorySecurityInheritance]$Inheritance =
+            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents
+    )
+
+    Add-ADDelegationSafe -TargetDN $TargetDN -GroupSam $GroupSam -Rights $Rights `
+        -ObjectType $ObjectType -InheritedObjectType $InheritedObjectType -Inheritance $Inheritance
+}
+
 function Invoke-PreFlightValidation {
     param(
         [hashtable]$Cfg,
@@ -357,6 +561,10 @@ function Invoke-PreFlightValidation {
 
     $errors   = New-Object System.Collections.Generic.List[string]
     $warnings = New-Object System.Collections.Generic.List[string]
+
+    $cfgValidation = Assert-Config -Cfg $Cfg
+    foreach ($e in $cfgValidation.Errors) { $errors.Add($e) }
+    foreach ($w in $cfgValidation.Warnings) { $warnings.Add($w) }
 
     # Validate required modules are available before doing anything else.
     $requiredModules = @('ActiveDirectory','GroupPolicy')
@@ -429,7 +637,9 @@ function Invoke-PreFlightValidation {
 #endregion
 
 # Run pre-flight before deriving deployment paths and before making changes.
-Invoke-PreFlightValidation -Cfg $Config -ValidateOnlyMode:$ValidateOnly
+Invoke-Phase -Name 'PRE-FLIGHT VALIDATION' -Block {
+    Invoke-PreFlightValidation -Cfg $Config -ValidateOnlyMode:$ValidateOnly
+}
 
 # Shorthand (resolved after pre-flight populates domain values)
 $DomainDN   = $Config.DomainDN
@@ -566,7 +776,7 @@ foreach ($zoneKey in $Config.ZoneServices.Keys) {
     foreach ($svc in $Config.ZoneServices[$zoneKey]) {
         # Determine tier from zone key
         $tierNum = $zoneKey.Substring(0,1)
-        $dlgPath = "OU=Groups,OU=Services,OU=Zone $zoneKey,OU=Tier $tierNum,OU=Tiers,$CorpOU"
+        $dlgPath = Get-OUPathForZone -TierNum $tierNum -ZoneKey $zoneKey -CorpBaseOU $CorpOU -ChildDNPrefix 'OU=Groups,OU=Services'
 
         foreach ($perm in $dlgPermissions) {
             $groupName = "Z$zoneKey-DLG-$svc-$perm"
@@ -831,20 +1041,17 @@ Write-Log 'Setting User Rights Assignments (Deny logon)...' INFO
 # T0 (DCs + PAWs): deny T1, T2, regular users
 $t0Deny = @('T1-ROLE-WS-Admins','T1-ROLE-Server-Admins','T1-ROLE-DNS-Admins',
              'T1-ROLE-Storage-Admins','T2-ROLE-HelpDesk','T2-ROLE-PW-Reset','Domain Users')
-Set-GPOUserRight 'GPO-T0-DenyLowerTier-Logon' 'SeDenyInteractiveLogonRight'       $t0Deny
-Set-GPOUserRight 'GPO-T0-DenyLowerTier-Logon' 'SeDenyRemoteInteractiveLogonRight' $t0Deny
-Set-GPOUserRight 'GPO-T0-DenyLowerTier-Logon' 'SeDenyNetworkLogonRight'           ($t0Deny | Where-Object {$_ -ne 'Domain Users'})
+Set-DenyLogonRightsBaseline -GPOName 'GPO-T0-DenyLowerTier-Logon' -GroupSamNames $t0Deny `
+    -NetworkGroupSamNames ($t0Deny | Where-Object { $_ -ne 'Domain Users' })
 
 # T1 (Servers): deny T2 + regular users
 $t1Deny = @('T2-ROLE-HelpDesk','T2-ROLE-PW-Reset','Domain Users')
-Set-GPOUserRight 'GPO-T1-DenyTier2-Logon' 'SeDenyInteractiveLogonRight'       $t1Deny
-Set-GPOUserRight 'GPO-T1-DenyTier2-Logon' 'SeDenyRemoteInteractiveLogonRight' $t1Deny
+Set-DenyLogonRightsBaseline -GPOName 'GPO-T1-DenyTier2-Logon' -GroupSamNames $t1Deny
 
 # T2 (Workstations): deny T0 + T1 admins (they use PAWs)
 $t2Deny = @('T0-ROLE-AD-Admins','T0-ROLE-PKI-Admins','T0-ROLE-Hyper-Admins','T0-ROLE-GPO-Admins',
              'T1-ROLE-WS-Admins','T1-ROLE-Server-Admins','T1-ROLE-DNS-Admins','T1-ROLE-Storage-Admins')
-Set-GPOUserRight 'GPO-T2-DenyT0T1-Logon' 'SeDenyInteractiveLogonRight'       $t2Deny
-Set-GPOUserRight 'GPO-T2-DenyT0T1-Logon' 'SeDenyRemoteInteractiveLogonRight' $t2Deny
+Set-DenyLogonRightsBaseline -GPOName 'GPO-T2-DenyT0T1-Logon' -GroupSamNames $t2Deny
 
 # ---- 8b. Audit, LAPS, Credential Guard ----
 Set-AuditPolicyInGPO  'GPO-T0-AuditPolicy'
@@ -1116,6 +1323,9 @@ foreach ($key in $report.Keys) {
     Write-Host ("  {0,-40} {1}" -f $key, $report[$key]) -ForegroundColor $color
 }
 Write-Host "========================================`n" -ForegroundColor Cyan
+
+$reportOutput = Export-ValidationReport -Report $report -OutputDirectory '.'
+Write-Log "Compliance artifacts: JSON=$($reportOutput.JsonPath) | CSV=$($reportOutput.CsvPath)" INFO
 
 Write-Log @"
 POST-DEPLOYMENT CHECKLIST (manual steps):
