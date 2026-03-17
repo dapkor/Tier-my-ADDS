@@ -1,0 +1,72 @@
+flowchart TD
+    %% Styling
+    classDef t0 fill:#2d0a0a,stroke:#ff4d4d,stroke-width:2px,color:#fff;
+    classDef t1 fill:#0a1a2d,stroke:#4d94ff,stroke-width:2px,color:#fff;
+    classDef t2 fill:#0a2d0a,stroke:#4dff4d,stroke-width:2px,color:#fff;
+    classDef layer fill:#1a1a1a,stroke:#d4af37,stroke-width:1px,color:#d4af37,stroke-dasharray: 5 5;
+    classDef zone fill:#333,stroke:#666,stroke-width:1px,color:#ddd,font-style:italic;
+
+    %% TIER 0
+    subgraph T0 ["🔴 TIER 0 — CONTROL PLANE (Identity & Root)"]
+        direction TB
+        PAW0["💻 PAW-T0<br/><small>Smartcard + WDAC + CredGuard</small>"]
+        
+        subgraph Z0A ["Zone 0A: Core Identity"]
+            DC["Domain Controllers"]
+            PKI["PKI / ADCS"]
+        end
+        
+        subgraph Z0B ["Zone 0B: Fabric"]
+            HV["vCenter / Nutanix"]
+        end
+
+        S0A["🛡️ Auth Silo 0A<br/><small>Kerberos Only / 60min TGT</small>"]
+        S0B["🛡️ Auth Silo 0B"]
+    end
+
+    %% TIER 1
+    subgraph T1 ["🔵 TIER 1 — MANAGEMENT PLANE (Servers)"]
+        direction TB
+        PAW1["💻 PAW-T1<br/><small>CredGuard + LAPS</small>"]
+        
+        Z1A["Zone 1A: SCCM / Intune"]
+        Z1B["Zone 1B: App & File Servers"]
+        Z1C["Zone 1C: DNS Infra"]
+        
+        S1["🛡️ Auth Silos 1A-1D"]
+    end
+
+    %% TIER 2
+    subgraph T2 ["🟢 TIER 2 — WORKLOAD PLANE (User Devices)"]
+        direction TB
+        PAW2["💻 T2 PAW / Jump"]
+        
+        Z2A["Zone 2A: Workstations"]
+        Z2B["Zone 2B: Business Servers"]
+        
+        S2["🛡️ Auth Silo 2A"]
+    end
+
+    %% ENFORCEMENT LAYERS
+    subgraph EL ["🔒 ENFORCEMENT LAYERS"]
+        direction LR
+        FAST{{"FAST<br/>Kerberos Armoring"}}
+        GPO{{"5x Deny Logon GPO<br/><small>Interactive/RDP/Net/Batch/Svc</small>"}}
+        PU{{"Protected Users<br/><small>No NTLM/RC4/Delegation</small>"}}
+        PSO{{"PSO Policies<br/><small>T0:20c | T1:14c | T2:12c</small>"}}
+        LAPS{{"LAPS<br/><small>T1 + T2 Admin</small>"}}
+        LSA{{"LSA PPL<br/><small>Anti-LSASS Dump</small>"}}
+    end
+
+    %% Relaties
+    PAW0 --> S0A & S0B
+    PAW1 --> S1
+    FAST -.->|Enabled for| S0A & S0B & S1 & S2
+    GPO -.->|Cross-Tier Block| T0 & T1 & T2
+    
+    %% Styling Classes Toewijzen
+    class T0,PAW0,DC,PKI,HV,S0A,S0B t0;
+    class T1,PAW1,Z1A,Z1B,Z1C,S1 t1;
+    class T2,PAW2,Z2A,Z2B,S2 t2;
+    class EL,FAST,GPO,PU,PSO,LAPS,LSA layer;
+    class Z0A,Z0B,Z1A,Z1B,Z1C,Z2A,Z2B zone;
