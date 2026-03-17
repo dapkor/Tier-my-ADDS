@@ -28,8 +28,11 @@
     Requires Server 2022 / Windows 11 for Windows LAPS (legacy LAPS otherwise).
 #>
 
-#Requires -Modules ActiveDirectory, GroupPolicy
 #Requires -RunAsAdministrator
+
+param(
+    [switch]$ValidateOnly
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -39,10 +42,10 @@ $ErrorActionPreference = 'Stop'
 # ============================================================
 $Config = @{
 
-    # --- Domain (auto-detected) ---
-    DomainDN   = (Get-ADDomain).DistinguishedName
-    DomainFQDN = (Get-ADDomain).DNSRoot
-    DomainNB   = (Get-ADDomain).NetBIOSName
+    # --- Domain (auto-detected in pre-flight) ---
+    DomainDN   = $null
+    DomainFQDN = $null
+    DomainNB   = $null
     CorpOU     = 'Corp'   # Top-level OU name
 
     # --- MEAM Zone Definitions ---
@@ -110,14 +113,6 @@ $Config = @{
     CreateTestAccounts = $true
 }
 
-# Auto-fill DNS zone
-if (-not $Config.DNS.ZoneName) { $Config.DNS.ZoneName = $Config.DomainFQDN }
-
-# Shorthand
-$DomainDN   = $Config.DomainDN
-$DomainFQDN = $Config.DomainFQDN
-$CorpOU     = "OU=$($Config.CorpOU),$DomainDN"
-
 #endregion
 
 # ============================================================
@@ -157,13 +152,6 @@ function New-GroupIfNotExists {
 }
 
 function Set-Member {
-    param([string]$Group, [string]$Member)
-        $existing = Get-ADGroupMember -Identity $Group -ErrorAction SilentlyContinue |
-                    Select-Object -ExpandProperty SamAccountName
-        if ($existing -notcontains $Member) {
-            Add-ADGroupMember -Identity $Group -Members $Member
-            Write-Log "  $Member -> $Group" OK
-        }
     param([string]$Group, [string]$Member)
     $existing = Get-ADGroupMember -Identity $Group -ErrorAction SilentlyContinue |
                 Select-Object -ExpandProperty SamAccountName
@@ -361,7 +349,94 @@ function Set-ADDelegation {
     Write-Log "  ACL: $GroupSam -> [$($Rights -join ',')] on $TargetDN" OK
 }
 
+function Invoke-PreFlightValidation {
+    param(
+        [hashtable]$Cfg,
+        [switch]$ValidateOnlyMode
+    )
+
+    $errors   = New-Object System.Collections.Generic.List[string]
+    $warnings = New-Object System.Collections.Generic.List[string]
+
+    # Validate required modules are available before doing anything else.
+    $requiredModules = @('ActiveDirectory','GroupPolicy')
+    if ($Cfg.DNS.Deploy) { $requiredModules += 'DnsServer' }
+
+    foreach ($moduleName in $requiredModules | Select-Object -Unique) {
+        if (-not (Get-Module -ListAvailable -Name $moduleName)) {
+            $errors.Add("Required module '$moduleName' not found (install RSAT component).")
+        }
+    }
+
+    try {
+        $domain = Get-ADDomain -ErrorAction Stop
+        $Cfg.DomainDN   = $domain.DistinguishedName
+        $Cfg.DomainFQDN = $domain.DNSRoot
+        $Cfg.DomainNB   = $domain.NetBIOSName
+    }
+    catch {
+        $errors.Add("Unable to query AD domain context via Get-ADDomain: $($_.Exception.Message)")
+    }
+
+    if ($Cfg.EnableAuthSilos -and $Cfg.DomainFQDN) {
+        $modeRank = @{
+            Windows2000Domain = 0
+            Windows2003InterimDomain = 1
+            Windows2003Domain = 2
+            Windows2008Domain = 3
+            Windows2008R2Domain = 4
+            Windows2012Domain = 5
+            Windows2012R2Domain = 6
+            Windows2016Domain = 7
+        }
+        $dflName = [string]$domain.DomainMode
+        if (-not $modeRank.ContainsKey($dflName) -or $modeRank[$dflName] -lt $modeRank['Windows2012R2Domain']) {
+            $errors.Add("Domain functional level '$dflName' is too low for Authentication Policy Silos (need Windows2012R2Domain+).")
+        }
+    }
+
+    if ($Cfg.DNS.Deploy -and [string]::IsNullOrWhiteSpace($Cfg.DNS.ServerName)) {
+        $errors.Add('DNS deployment is enabled but Config.DNS.ServerName is empty.')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Cfg.DNS.ZoneName) -and $Cfg.DomainFQDN) {
+        $Cfg.DNS.ZoneName = $Cfg.DomainFQDN
+    }
+
+    if ($Cfg.BreakGlass.TempPassword -like 'ChangeMe!*') {
+        $warnings.Add('Break-glass TempPassword appears to be a default placeholder. Change it before production use.')
+    }
+
+    if ($Cfg.CreateTestAccounts) {
+        $warnings.Add('CreateTestAccounts is enabled; test users and passwords will be created unless disabled.')
+    }
+
+    Write-Log '=== PRE-FLIGHT VALIDATION ===' INFO
+    if ($warnings.Count -gt 0) {
+        foreach ($w in $warnings) { Write-Log $w WARN }
+    }
+    if ($errors.Count -gt 0) {
+        foreach ($e in $errors) { Write-Log $e ERROR }
+        throw "Pre-flight validation failed with $($errors.Count) error(s)."
+    }
+    Write-Log 'Pre-flight validation passed.' OK
+
+    if ($ValidateOnlyMode) {
+        Write-Log 'ValidateOnly specified. Exiting before deployment phases.' INFO
+    }
+}
+
 #endregion
+
+# Run pre-flight before deriving deployment paths and before making changes.
+Invoke-PreFlightValidation -Cfg $Config -ValidateOnlyMode:$ValidateOnly
+
+# Shorthand (resolved after pre-flight populates domain values)
+$DomainDN   = $Config.DomainDN
+$DomainFQDN = $Config.DomainFQDN
+$CorpOU     = "OU=$($Config.CorpOU),$DomainDN"
+
+if ($ValidateOnly) { return }
 
 # ============================================================
 #region 2. OU HIERARCHY – MEAM ZONE/SERVICE STRUCTURE
@@ -382,10 +457,10 @@ $TiersOU = "OU=Tiers,$CorpOU"
 foreach ($tier in @('T0','T1','T2')) {
     $tierNum   = $tier.Substring(1)
     $tierLabel = switch ($tier) { 'T0' {'Tier 0 - Control Plane'}; 'T1' {'Tier 1 - Management Plane'}; 'T2' {'Tier 2 - Workload Plane'} }
-    $tierOU    = Ensure-OU -Name "Tier $tierNum" -Path $TiersOU -Description $tierLabel
+    $tierOU    = Test-OU -Name "Tier $tierNum" -Path $TiersOU -Description $tierLabel
 
     # PAW OU at tier root (MEAM: PAWs per tier)
-    Ensure-OU -Name "PAWs" -Path $tierOU -Description "Tier $tierNum Privileged Access Workstations" | Out-Null
+    Test-OU -Name "PAWs" -Path $tierOU -Description "Tier $tierNum Privileged Access Workstations" | Out-Null
 
     foreach ($zoneKey in $Config.Zones[$tier].Keys) {
         $zoneLabel = $Config.Zones[$tier][$zoneKey]
@@ -491,8 +566,7 @@ foreach ($zoneKey in $Config.ZoneServices.Keys) {
     foreach ($svc in $Config.ZoneServices[$zoneKey]) {
         # Determine tier from zone key
         $tierNum = $zoneKey.Substring(0,1)
-        $tierLabel = "Tier $tierNum"
-        $dlgPath = "OU=Groups,OU=Services,OU=Zone $zoneKey,$tierLabel,OU=Tiers,$CorpOU"
+        $dlgPath = "OU=Groups,OU=Services,OU=Zone $zoneKey,OU=Tier $tierNum,OU=Tiers,$CorpOU"
 
         foreach ($perm in $dlgPermissions) {
             $groupName = "Z$zoneKey-DLG-$svc-$perm"
@@ -834,7 +908,7 @@ foreach ($bk in @($Config.BreakGlass.Account1, $Config.BreakGlass.Account2)) {
         -Desc 'BREAK-GLASS: Emergency T0 account. Offline vault. Audit ALL usage.' `
         -Password $Config.BreakGlass.TempPassword -PwdNeverExpires $true `
         -SmartcardRequired $false   # break-glass explicitly no smartcard (vault credentials)
-    Ensure-Member -Group 'T0-ROLE-AD-Admins' -Member $bk
+    Set-Member -Group 'T0-ROLE-AD-Admins' -Member $bk
     Disable-ADAccount -Identity $bk
     Write-Log "Break-glass '$bk': DISABLED. Store credentials in offline vault (printed, sealed safe)." WARN
 }
