@@ -281,6 +281,36 @@ function Set-CredentialGuardGPO {
     Write-Log "  Credential Guard -> '$GPOName'" OK
 }
 
+function Set-KerberosArmoringGPO {
+    param([string]$GPOName)
+
+    # DC policy: KDC support for claims/compound auth/Kerberos armoring.
+    Set-GPRegistryValue -Name $GPOName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Kdc' -ValueName 'KdcUseRequestedEtypesForTickets' -Type DWord -Value 1 | Out-Null
+    Set-GPRegistryValue -Name $GPOName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Kdc' -ValueName 'EnableCbacAndArmor' -Type DWord -Value 2 | Out-Null
+
+    # Client policy: Kerberos client support for claims/compound auth.
+    Set-GPRegistryValue -Name $GPOName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows\Kerberos\Parameters' -ValueName 'EnableCbacAndArmor' -Type DWord -Value 1 | Out-Null
+
+    Write-Log "  Kerberos armoring -> '$GPOName'" OK
+}
+
+function Set-NTLMRestrictGPO {
+    param([string]$GPOName)
+
+    $lsaKey = 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa'
+
+    # Enforce NTLMv2 and disable LM/NTLMv1.
+    Set-GPRegistryValue -Name $GPOName -Key $lsaKey -ValueName 'LmCompatibilityLevel' -Type DWord -Value 5 | Out-Null
+
+    # Start in audit mode for inbound/outbound NTLM restrictions.
+    Set-GPRegistryValue -Name $GPOName -Key $lsaKey -ValueName 'RestrictReceivingNTLMTraffic' -Type DWord -Value 1 | Out-Null
+    Set-GPRegistryValue -Name $GPOName -Key $lsaKey -ValueName 'RestrictSendingNTLMTraffic'   -Type DWord -Value 1 | Out-Null
+    Set-GPRegistryValue -Name $GPOName -Key $lsaKey -ValueName 'AuditReceivingNTLMTraffic'    -Type DWord -Value 2 | Out-Null
+    Set-GPRegistryValue -Name $GPOName -Key $lsaKey -ValueName 'AuditNTLMInDomain'             -Type DWord -Value 7 | Out-Null
+
+    Write-Log "  NTLM restriction baseline -> '$GPOName'" OK
+}
+
 function Set-LAPSGPO {
     param([string]$GPOName, [bool]$UseWindowsLAPS = $false)
     if ($UseWindowsLAPS) {
@@ -1004,6 +1034,10 @@ POST-SILO MANUAL STEPS:
 Write-Log '=== PHASE 8: GPOs ===' INFO
 
 $GPODefs = @(
+    # Domain-wide prerequisites/restrictions
+    @{ Name='GPO-KerberosArmoring';       LinkOU=$DomainDN;                                                      Tier=0 }
+    @{ Name='GPO-T0-NTLM-Restrict';       LinkOU=$DomainDN;                                                      Tier=0 }
+
     # T0
     @{ Name='GPO-T0-DenyLowerTier-Logon'; LinkOU="OU=Domain Controllers,$DomainDN";                          Tier=0 }
     @{ Name='GPO-T0-PAW-Baseline';        LinkOU="OU=PAWs,OU=Tier 0,OU=Tiers,$CorpOU";                      Tier=0 }
@@ -1054,6 +1088,8 @@ $t2Deny = @('T0-ROLE-AD-Admins','T0-ROLE-PKI-Admins','T0-ROLE-Hyper-Admins','T0-
 Set-DenyLogonRightsBaseline -GPOName 'GPO-T2-DenyT0T1-Logon' -GroupSamNames $t2Deny
 
 # ---- 8b. Audit, LAPS, Credential Guard ----
+Set-KerberosArmoringGPO 'GPO-KerberosArmoring'
+Set-NTLMRestrictGPO     'GPO-T0-NTLM-Restrict'
 Set-AuditPolicyInGPO  'GPO-T0-AuditPolicy'
 Set-LAPSGPO           'GPO-T1-LAPS' -UseWindowsLAPS $Config.EnableWindowsLAPS
 Set-LAPSGPO           'GPO-T2-LAPS' -UseWindowsLAPS $Config.EnableWindowsLAPS

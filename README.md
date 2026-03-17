@@ -7,18 +7,21 @@
 
 ## Table of Contents
 1. [Model Overview](#model-overview)
-2. [Three Commandments](#three-commandments)
-3. [Tier Structure](#tier-structure)
-4. [Zone Definitions](#zone-definitions)
-5. [Enforcement Layers](#enforcement-layers)
-6. [Authentication Flow](#authentication-flow)
-7. [Group Naming Convention](#group-naming-convention)
-8. [OU Hierarchy](#ou-hierarchy)
-9. [GPO Matrix](#gpo-matrix)
-10. [PSO Matrix](#pso-matrix)
-11. [Platform Integrations](#platform-integrations)
-12. [Operational Runbook](#operational-runbook)
-13. [References](#references)
+2. [Scripts In This Repository](#scripts-in-this-repository)
+3. [Pre-Flight and Safe Execution](#pre-flight-and-safe-execution)
+4. [Three Commandments](#three-commandments)
+5. [Tier Structure](#tier-structure)
+6. [Zone Definitions](#zone-definitions)
+7. [Enforcement Layers](#enforcement-layers)
+8. [Authentication Flow](#authentication-flow)
+9. [Group Naming Convention](#group-naming-convention)
+10. [OU Hierarchy](#ou-hierarchy)
+11. [GPO Matrix](#gpo-matrix)
+12. [PSO Matrix](#pso-matrix)
+13. [Monitoring: Auto-Tiering Scanner](#monitoring-auto-tiering-scanner)
+14. [Platform Integrations](#platform-integrations)
+15. [Operational Runbook](#operational-runbook)
+16. [References](#references)
 
 ---
 
@@ -34,6 +37,44 @@ as the object being secured. The model enforces this through two independent, co
 
 > ⚠️ Both layers are required. GPO alone can be bypassed by local admins. Silos alone do not cover  
 > all logon types. Together they provide defense-in-depth.
+
+---
+
+## Scripts In This Repository
+
+| Script | Purpose |
+|---|---|
+| `1. Main/script_v2.ps1` | Full greenfield MEAM deployment (OUs, groups, PSOs, Auth Policies/Silos, GPOs, ACL delegation, break-glass/test accounts, DNS delegation, compliance report). |
+| `2.Role_segregation/DNS_seperate.ps1` | DNS role segregation helper (repository utility script). |
+| `3. Monitoring/Auto-Tiering Computer account scanner.ps1` | Tier placement monitoring for computer objects, with CSV output and optional alerting. |
+
+---
+
+## Pre-Flight and Safe Execution
+
+`script_v2.ps1` supports a pre-flight mode so you can validate prerequisites before making AD changes.
+
+### Validate only
+
+```powershell
+.\script_v2.ps1 -ValidateOnly
+```
+
+### What pre-flight validates
+
+- Required modules are available (`ActiveDirectory`, `GroupPolicy`, and `DnsServer` when DNS deploy is enabled)
+- AD domain context can be queried (`Get-ADDomain`)
+- Domain functional level is high enough for Authentication Policy Silos (`Windows2012R2Domain+`)
+- Config structure and values are consistent (zones, services, required fields)
+- High-risk defaults are flagged as warnings (placeholder break-glass password, test account creation enabled)
+
+### New execution/reporting behavior in `script_v2.ps1`
+
+- Phase wrapper with timing and standardized start/complete/fail logs
+- Idempotent ACL delegation (`Add-ADDelegationSafe`) to avoid duplicate ACEs on rerun
+- Centralized OU DN construction helper for zone paths
+- Deny-logon baseline helper applies all five deny rights consistently
+- Compliance report now exports to JSON and CSV in addition to console output
 
 ---
 
@@ -215,11 +256,9 @@ DC=corp,DC=example,DC=com
 
 | GPO Name | Linked OU | Key Settings |
 |----------|-----------|-------------|
-| GPO-KerberosArmoring | Domain root | FAST/Kerberos armoring (DCs + clients) |
 | GPO-T0-DenyLowerTier-Logon | OU=Domain Controllers | Deny T1+T2 (5 rights) |
 | GPO-T0-PAW-Baseline | OU=PAWs Tier 0 | WDAC, no internet, CG, smartcard |
 | GPO-T0-AuditPolicy | OU=Domain Controllers | 15 advanced audit subcategories |
-| GPO-T0-NTLM-Restrict | Domain root | Block NTLMv1; audit NTLMv2 |
 | GPO-T1-DenyTier2-Logon | OU=Tier 1 | Deny T2 (5 rights) |
 | GPO-T1-Server-Baseline | OU=Tier 1 | LSA protection, CG, secure baseline |
 | GPO-T1-LAPS | OU=Tier 1 | LAPS 30-day rotation, 20-char |
@@ -238,6 +277,41 @@ DC=corp,DC=example,DC=com
 | PSO-Tier1 | 2 | 14 chars | 180 days | 5 attempts/30min | T1 role groups |
 | PSO-Tier2 | 3 | 12 chars | 180 days | 5 attempts/30min | T2 role groups |
 | PSO-SvcAccts | 4 | 30 chars | 365 days | None | Service account groups |
+
+---
+
+## Monitoring: Auto-Tiering Scanner
+
+Script: `3. Monitoring/Auto-Tiering Computer account scanner.ps1`
+
+### Purpose
+
+- Scans AD computer objects and detects likely tier-placement mismatches based on naming patterns and OU path patterns.
+- Exports findings to CSV and can send an email alert when violations are found.
+
+### Parameters
+
+- `DomainDN`: defaults to `(Get-ADDomain).DistinguishedName`
+- `ReportPath`: defaults to `C:\MEAM\TierScan-YYYYMMDD.csv`
+- `AlertTo`: email recipient for alert message
+
+### Current behavior and scope
+
+- Scans computer objects only (users/service accounts are not yet included)
+- Uses regex-based tier inference from computer names
+- Produces remediation suggestions (`Move-ADObject` example)
+- Auto-fix logic is intentionally commented out by default
+
+### Prerequisites
+
+- PowerShell `ActiveDirectory` module
+- SMTP connectivity for alerting (`Send-MailMessage` currently used)
+
+### Recommended hardening follow-ups
+
+- Replace `Send-MailMessage` with a modern mail/API approach
+- Add explicit `-WhatIf`/`-Confirm` support before enabling any auto-move logic
+- Expand scanner coverage to user/service accounts and zone-specific rules
 
 ---
 
@@ -292,7 +366,7 @@ Use Prism Central RBAC to restrict T1 admins to non-T0 clusters.
 4. Verify GPO application: `gpresult /r /scope computer`
 
 ### Break-Glass Usage
-1. Remove from `Disabled Users` OU → enable account
+1. Enable designated break-glass account (created disabled by deployment script)
 2. Log usage in security ticket system (mandatory)
 3. Re-disable account immediately after use
 4. Rotate credentials; return to offline vault (sealed envelope)
