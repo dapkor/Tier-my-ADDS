@@ -122,4 +122,4 @@ flowchart TD
     class Z0A,Z0B zone;
     class SVC,SCANNER,REPORT,CICD monitoring;
     class BG breakglass;
-    class CSP principle;
+    class CSP principle;If you want, I can also make a third variant optimized for executive one-slide summaries (even fewer nodes, stronger business framing

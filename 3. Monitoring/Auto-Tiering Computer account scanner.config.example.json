@@ -60,10 +60,20 @@
     "moveEventServer": "",
     "moveEventMax": 5000
   },
+  "queryTuning": {
+    "retryCount": 2,
+    "retryDelaySeconds": 2,
+    "cimOperationTimeoutSeconds": 15,
+    "eventQueryTimeoutSeconds": 20
+  },
   "alert": {
-    "enabled": true,
-    "to": "admin@contoso.com",
-    "from": "meam-scanner@contoso.com",
-    "smtpServer": "smtp.contoso.com"
+    "enabled": false,
+    "mode": "webhook",
+    "webhookUrlEnvVar": "MEAM_SCANNER_WEBHOOK_URL",
+    "authorizationEnvVar": "MEAM_SCANNER_WEBHOOK_AUTHORIZATION",
+    "timeoutSeconds": 30,
+    "headers": {
+      "X-Source": "meam-auto-tiering-scanner"
+    }
   }
 }

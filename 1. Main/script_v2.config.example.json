@@ -85,7 +85,11 @@
   "BreakGlass": {
     "Account1": "brk-glass-01",
     "Account2": "brk-glass-02",
-    "TempPassword": "ChangeMe!BrkGlass2026"
+    "TempPasswordEnvVar": "MEAM_BREAKGLASS_TEMP_PASSWORD"
+  },
+  "QueryTuning": {
+    "RetryCount": 2,
+    "RetryDelaySeconds": 2
   },
   "EnableAuthSilos": true,
   "EnableSmartcard": true,

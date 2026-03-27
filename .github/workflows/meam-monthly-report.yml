@@ -41,6 +41,9 @@
 
 name: MEAM Monthly Tier Report
 
+permissions:
+  contents: read
+
 on:
   # Run at 07:00 UTC on the 1st of every month
   schedule:
@@ -56,7 +59,7 @@ on:
       open_report:
         description: 'Upload report as artifact'
         required: false
-        default: 'true'
+        default: true
         type: boolean
 
 env:
@@ -73,6 +76,8 @@ jobs:
       # ── 1. Checkout ───────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # ── 2. Verify AD module ───────────────────────────────────────────────
       - name: Verify ActiveDirectory module
@@ -173,25 +178,25 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-      # ── 6. (Optional) Email the report ───────────────────────────────────
-      #    Requires SMTP credentials as secrets: SMTP_SERVER, SMTP_FROM, SMTP_TO
-      #    Uncomment and fill in the secrets if you want email delivery.
+      # ── 6. (Optional) Notify via webhook ─────────────────────────────────
+      #    Requires WEBHOOK_URL secret and optionally WEBHOOK_AUTHORIZATION.
+      #    Uncomment and fill in the secrets if you want downstream notification.
       #
-      # - name: Email report
+      # - name: Notify webhook
       #   shell: pwsh
       #   env:
-      #     SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-      #     SMTP_FROM:   ${{ secrets.SMTP_FROM }}
-      #     SMTP_TO:     ${{ secrets.SMTP_TO }}
+      #     WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      #     WEBHOOK_AUTHORIZATION: ${{ secrets.WEBHOOK_AUTHORIZATION }}
       #   run: |
       #     $reportFile = '${{ steps.config.outputs.REPORT_PATH }}'
-      #     if (-not (Test-Path $reportFile)) { Write-Warning 'Report file not found, skipping email.'; return }
-      #     Send-MailMessage `
-      #       -SmtpServer $env:SMTP_SERVER `
-      #       -From       $env:SMTP_FROM `
-      #       -To         ($env:SMTP_TO -split ',') `
-      #       -Subject    "MEAM Monthly Tier Report — $(Get-Date -Format 'MMMM yyyy')" `
-      #       -Body       "Please find the MEAM Tier Compliance Report attached." `
-      #       -Attachments $reportFile `
-      #       -Priority   Normal
-      #     Write-Host 'Email sent.' -ForegroundColor Green
+      #     if (-not (Test-Path $reportFile)) { Write-Warning 'Report file not found, skipping webhook notification.'; return }
+      #     $payload = @{
+      #       title = 'MEAM Monthly Tier Report'
+      #       reportPath = $reportFile
+      #       reportName = '${{ steps.config.outputs.REPORT_NAME }}'
+      #       generatedAt = (Get-Date).ToString('o')
+      #     } | ConvertTo-Json -Depth 4
+      #     $headers = @{}
+      #     if (-not [string]::IsNullOrWhiteSpace($env:WEBHOOK_AUTHORIZATION)) { $headers.Authorization = $env:WEBHOOK_AUTHORIZATION }
+      #     Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -ContentType 'application/json' -Headers $headers -Body $payload
+      #     Write-Host 'Webhook notification sent.' -ForegroundColor Green

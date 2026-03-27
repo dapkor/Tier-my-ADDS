@@ -15,6 +15,11 @@
     "Account2": "brk-glass-02"
   },
 
+  "QueryTuning": {
+    "RetryCount": 2,
+    "RetryDelaySeconds": 2
+  },
+
   "Zones": {
     "T0": {
       "0A": "Domain Management",

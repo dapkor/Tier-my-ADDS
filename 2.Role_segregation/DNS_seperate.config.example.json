@@ -17,6 +17,10 @@
     "10.10.20.0"
   ],
   "autoApprove": false,
+  "queryTuning": {
+    "retryCount": 2,
+    "retryDelaySeconds": 2
+  },
   "outputs": {
     "baselineJsonPath": "C:\\MEAM\\DNS-Baseline.json",
     "changePlanPath": "C:\\MEAM\\DNS-ChangePlan.txt",

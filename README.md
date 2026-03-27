@@ -50,8 +50,9 @@ as the object being secured. The model enforces this through two independent, co
 | `1. Main/script_v2.ps1` | Full greenfield MEAM deployment (OUs, groups, PSOs, Auth Policies/Silos, GPOs, ACL delegation, break-glass/test accounts, DNS delegation, compliance report). |
 | `1. Main/script_v2.config.example.json` | Ready-to-run JSON config for `script_v2.ps1`. Copy, fill in your domain values, run. |
 | `2.Role_segregation/DNS_seperate.ps1` | DNS role segregation helper (repository utility script). |
-| `3. Monitoring/Auto-Tiering Computer account scanner.ps1` | Tier placement monitoring for computer objects — scoring engine, CSV output, optional email alert. |
+| `3. Monitoring/Auto-Tiering Computer account scanner.ps1` | Tier placement monitoring for computer objects — scoring engine, CSV output, optional webhook alert. |
 | `3. Monitoring/MEAM-Tier-Report.ps1` | **Monthly HTML compliance report** — T0 & T1 accounts, groups, PSOs, Auth Silos, PAWs, break-glass. Designed for scheduled CI/CD pipeline runs. |
+| `4. Validation/Validate-MEAM-Deployment.ps1` | Post-deployment acceptance validator for OU layout, PSOs, auth silos, GPOs, Protected Users, and break-glass accounts. |
 | `3. Monitoring/MEAM-Tier-Report.config.example.json` | Example config for the HTML report script. |
 | `flowchart TD.presentation.txt` | Stakeholder-friendly Mermaid diagram (presentation view) with simplified labels and clean control narratives. |
 | `flowchart TD.executive.txt` | Executive one-slide Mermaid diagram focused on business outcomes, governance cadence, and risk reduction. |
@@ -76,7 +77,14 @@ as the object being secured. The model enforces this through two independent, co
 - AD domain context can be queried (`Get-ADDomain`)
 - Domain functional level is high enough for Authentication Policy Silos (`Windows2012R2Domain+`)
 - Config structure and values are consistent (zones, services, required fields)
-- High-risk defaults are flagged as warnings (placeholder break-glass password, test account creation enabled)
+- Break-glass secret is present and meets the minimum length requirement
+- High-risk defaults are flagged as warnings (plaintext break-glass password in config, test account creation enabled)
+
+### Secret handling
+
+- Do not store break-glass passwords in JSON config files committed to source control.
+- Prefer `BreakGlass.TempPasswordEnvVar` in the config and provide the value at runtime through an environment variable such as `MEAM_BREAKGLASS_TEMP_PASSWORD`.
+- Keep `CreateTestAccounts` disabled outside lab environments. If you enable it, provide each lab password through the environment variables `MEAM_TEST_PASSWORD_ADM_T0_TEST01`, `MEAM_TEST_PASSWORD_ADM_T1_SRV01`, `MEAM_TEST_PASSWORD_ADM_T1_DNS01`, and `MEAM_TEST_PASSWORD_ADM_T2_HD01`.
 
 ### New execution/reporting behavior in `script_v2.ps1`
 
@@ -85,6 +93,15 @@ as the object being secured. The model enforces this through two independent, co
 - Centralized OU DN construction helper for zone paths
 - Deny-logon baseline helper applies all five deny rights consistently
 - Compliance report now exports to JSON and CSV in addition to console output
+
+### Query tuning
+
+- `script_v2.config.example.json`, `DNS_seperate.config.example.json`, `MEAM-Tier-Report.config.example.json`, and `Auto-Tiering Computer account scanner.config.example.json` now expose optional retry tuning values.
+- Use these to bound transient failures without changing script code:
+   - `RetryCount` / `retryCount`
+   - `RetryDelaySeconds` / `retryDelaySeconds`
+   - `cimOperationTimeoutSeconds` and `eventQueryTimeoutSeconds` in the scanner config
+- These settings are optional. If omitted, the scripts use conservative built-in defaults.
 
 ---
 
@@ -298,8 +315,9 @@ Script: `3. Monitoring/Auto-Tiering Computer account scanner.ps1`
 
 - Scans AD computer objects and detects likely tier-placement mismatches based on naming patterns and OU path patterns.
 - Scoring engine with configurable weights per signal type (OU, name, group, SPN, OS, events, recent moves).
-- Exports findings to CSV and can send an email alert when violations are found.
+- Exports findings to CSV and can send a webhook alert when violations are found.
 - Detects high-risk moves (e.g. Tier 0 → Tier 1 lateral movement) via Security event ID 5139.
+- Webhook notifications must use `https://` endpoints and are validated during pre-flight.
 
 ### Parameters
 
@@ -319,13 +337,26 @@ Script: `3. Monitoring/Auto-Tiering Computer account scanner.ps1`
 | `targetOUByTier` | Target OU DNs for remediation suggestions |
 | `weights` | Scoring weights per signal type |
 | `signals` | Feature flags (useRoleSignals, useEventSignals, etc.) |
-| `alert` | Email alert config (`enabled`, `to`, `from`, `smtpServer`) |
+| `alert` | Webhook alert config (`enabled`, `mode`, `webhookUrlEnvVar`, optional `authorizationEnvVar`, `headers`) |
+
+Optional:
+
+| Key | Description |
+|---|---|
+| `queryTuning` | Retry/timeout controls for AD, CIM, and event-log queries |
 
 ### Prerequisites
 
 - PowerShell `ActiveDirectory` module (RSAT)
 - Read-only domain account (Domain Users is sufficient)
-- SMTP connectivity for alerting (optional)
+- HTTPS connectivity to your webhook endpoint for alerting (optional)
+- If `authorizationEnvVar` is configured but unset, the scanner logs a warning and sends the webhook without an `Authorization` header.
+
+### Alerting notes
+
+- Only `https://` webhook endpoints are accepted.
+- Prefer `webhookUrlEnvVar` and `authorizationEnvVar` over inline secrets in JSON.
+- `-LintConfigOnly` now validates the alert transport settings before any AD queries are made.
 
 ---
 
@@ -334,7 +365,7 @@ Script: `3. Monitoring/Auto-Tiering Computer account scanner.ps1`
 Script: `3. Monitoring/MEAM-Tier-Report.ps1`
 
 Generates a **fully self-contained HTML report** — no external dependencies, single file, open in any browser.  
-Designed to run monthly via CI/CD pipeline and be published as a pipeline artifact or emailed to security staff.
+Designed to run monthly via CI/CD pipeline and be published as a pipeline artifact or forwarded through a webhook notifier.
 
 ### What the report covers
 
@@ -383,12 +414,54 @@ Copy-Item "3. Monitoring\MEAM-Tier-Report.config.example.json" `
 Pass `-StaleThresholdDays` (default: `90`) to control when an account is flagged as stale.  
 Any enabled account with no logon in that many days is highlighted in the report with a warning badge.
 
+Optional:
+
+- `QueryTuning.RetryCount`
+- `QueryTuning.RetryDelaySeconds`
+
+These settings help the report tolerate transient AD or Group Policy query failures on busy or slow domain controllers.
+
+---
+
+## Post-Deployment Validation
+
+Script: `4. Validation/Validate-MEAM-Deployment.ps1`
+
+This validator runs after `1. Main/script_v2.ps1` and checks that the expected MEAM structure exists in AD. It is meant to be an acceptance test, not just a log review.
+
+### What it checks
+
+- Core OU hierarchy under `OU=<CorpOU>`
+- Zone and service OUs derived from the deployment config
+- Fine-grained password policies (PSOs)
+- Core GPOs when the `GroupPolicy` module is available
+- PAW silos and per-zone auth silos when `EnableAuthSilos=true`
+- Protected Users role-group nesting
+- Domain Admins direct-user hygiene
+- Break-glass account presence and disabled state
+
+### Usage
+
+```powershell
+.\4. Validation\Validate-MEAM-Deployment.ps1 `
+   -ConfigPath .\1. Main\script_v2.config.json
+
+.\4. Validation\Validate-MEAM-Deployment.ps1 `
+   -ConfigPath .\1. Main\script_v2.config.json `
+   -OutputPath .\reports\meam-validation.json
+```
+
+### Output
+
+- Console summary with PASS/WARN/FAIL/SKIPPED counts
+- JSON report with per-check details for pipeline or audit use
+
 ---
 
 ## CI/CD Pipeline Setup
 
 Both pipeline files use the same self-hosted runner/agent with the requirements above.  
-Neither pipeline requires secrets beyond the config JSON and optional SMTP credentials.
+Neither pipeline requires secrets beyond the config JSON and optional webhook credentials.
 
 ### GitHub Actions — `.github/workflows/meam-monthly-report.yml`
 
@@ -398,7 +471,7 @@ Neither pipeline requires secrets beyond the config JSON and optional SMTP crede
 | **Runner label** | `ad-access` (must match your self-hosted runner label) |
 | **Config source** | Secret `MEAM_REPORT_CONFIG_JSON` **or** committed `3. Monitoring\MEAM-Tier-Report.config.json` |
 | **Artifact retention** | 90 days |
-| **Email** | Uncomment `Email report` step; set `SMTP_SERVER`, `SMTP_FROM`, `SMTP_TO` secrets |
+| **Webhook** | Add a follow-up step that posts `generatedReportPath` or the artifact URL to your webhook endpoint using `Invoke-RestMethod` |
 
 **Quick setup:**
 ```
@@ -423,7 +496,7 @@ Neither pipeline requires secrets beyond the config JSON and optional SMTP crede
 | **Agent pool** | `MEAM-Agents` (update `name:` field to match your pool) |
 | **Config source** | Pipeline variable `MEAM_REPORT_CONFIG_JSON` (mark as secret) **or** committed config file |
 | **Artifact** | Published as `MEAM-TierReport-<BuildId>` pipeline artifact |
-| **Email** | Uncomment `Email report` task; add `SMTP_SERVER`, `SMTP_FROM`, `SMTP_TO` to variable group `meam-report-config` |
+| **Webhook** | Add a follow-up task that posts `generatedReportPath` or the artifact URL to your webhook endpoint using `Invoke-RestMethod` |
 
 **Quick setup:**
 ```

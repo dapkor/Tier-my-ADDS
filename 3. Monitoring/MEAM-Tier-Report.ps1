@@ -92,18 +92,99 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$script:QueryTuning = [ordered]@{
+    RetryCount = 2
+    RetryDelaySeconds = 2
+}
+
+function New-DirectoryForFilePath {
+    param([Parameter(Mandatory)][string]$FilePath)
+
+    $dir = Split-Path -LiteralPath $FilePath -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Set-TextFileContent {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [AllowEmptyString()][Parameter(Mandatory)]$Value
+    )
+
+    New-DirectoryForFilePath -FilePath $FilePath
+    Set-Content -LiteralPath $FilePath -Value $Value -Encoding UTF8
+}
+
+function Get-OptionalIntValue {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$PropertyName,
+        [Parameter(Mandatory)][int]$DefaultValue
+    )
+
+    if ($null -eq $Object -or -not $Object.PSObject.Properties.Name.Contains($PropertyName)) {
+        return $DefaultValue
+    }
+
+    $parsed = 0
+    if ([int]::TryParse([string]$Object.$PropertyName, [ref]$parsed) -and $parsed -ge 0) {
+        return $parsed
+    }
+
+    return $DefaultValue
+}
+
+function Initialize-QueryTuning {
+    param($Config)
+
+    $settings = $null
+    if ($Config.PSObject.Properties.Name.Contains('QueryTuning')) {
+        $settings = $Config.QueryTuning
+    }
+
+    $script:QueryTuning = [ordered]@{
+        RetryCount = Get-OptionalIntValue -Object $settings -PropertyName 'RetryCount' -DefaultValue 2
+        RetryDelaySeconds = Get-OptionalIntValue -Object $settings -PropertyName 'RetryDelaySeconds' -DefaultValue 2
+    }
+}
+
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    $attempt = 0
+    while ($true) {
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            if ($attempt -ge [int]$script:QueryTuning.RetryCount) {
+                throw
+            }
+
+            $attempt++
+            Write-Warning ("{0} failed on attempt {1}. Retrying in {2} second(s): {3}" -f $Operation, $attempt, $script:QueryTuning.RetryDelaySeconds, $_.Exception.Message)
+            Start-Sleep -Seconds ([int]$script:QueryTuning.RetryDelaySeconds)
+        }
+    }
+}
+
 # ─── Config load ──────────────────────────────────────────────────────────────
 if ($PSBoundParameters.ContainsKey('ConfigPath')) {
-    if (-not (Test-Path $ConfigPath)) { throw "Config file not found: $ConfigPath" }
-    $rawJson = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { throw "Config file not found: $ConfigPath" }
+    $rawJson = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
 } else {
     $rawJson = $ConfigJson
 }
 try { $Cfg = $rawJson | ConvertFrom-Json -Depth 20 } catch { throw "Invalid JSON: $($_.Exception.Message)" }
+Initialize-QueryTuning -Config $Cfg
 
 # ─── Domain detection ────────────────────────────────────────────────────────
 Write-Host '[INFO] Connecting to Active Directory...' -ForegroundColor Cyan
-$adDomain   = Get-ADDomain
+$adDomain   = Invoke-WithRetry -Operation 'Get-ADDomain' -ScriptBlock { Get-ADDomain }
 $DomainFQDN = $adDomain.DNSRoot
 $DomainDN   = $adDomain.DistinguishedName
 $CorpOU     = if ($Cfg.PSObject.Properties.Name -contains 'CorpOU') { [string]$Cfg.CorpOU } else { 'Corp' }
@@ -116,7 +197,7 @@ if (-not $PSBoundParameters.ContainsKey('OutputPath') -or [string]::IsNullOrWhit
     $OutputPath = ".\MEAM-TierReport-$(Get-Date -Format 'yyyyMMdd').html"
 }
 $OutputDir = Split-Path -Parent $OutputPath
-if ($OutputDir -and -not (Test-Path $OutputDir)) { New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null }
+if ($OutputDir -and -not (Test-Path -LiteralPath $OutputDir)) { New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null }
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 function Esc([string]$s) {
@@ -164,58 +245,60 @@ foreach ($tier in @('T0','T1')) {
     $ouLabel = if ($tier -eq 'T0') { 'Tier 0' } else { 'Tier 1' }
     $base = "OU=$ouLabel,$TiersDN"
     try {
-        if (Get-ADOrganizationalUnit -Identity $base -ErrorAction SilentlyContinue) {
-            $collect["${tier}Users"] = @(Get-ADUser -Filter * -SearchBase $base -SearchScope Subtree -Properties $userProps -ErrorAction Stop)
-            Write-Host "  [OK] $($collect["${tier}Users"].Count) $tier user(s)"
+        if (Invoke-WithRetry -Operation "Get-ADOrganizationalUnit $base" -ScriptBlock { Get-ADOrganizationalUnit -Identity $base -ErrorAction SilentlyContinue }) {
+            $userKey = '{0}Users' -f $tier
+            $collect[$userKey] = @(Invoke-WithRetry -Operation "Get-ADUser tier $tier" -ScriptBlock { Get-ADUser -Filter * -SearchBase $base -SearchScope Subtree -Properties $userProps -ErrorAction Stop })
+            Write-Host ("  [OK] {0} {1} user(s)" -f $collect[$userKey].Count, $tier)
         } else {
             Write-Warning "OU not found: $base"
         }
-    } catch { Write-Warning "T${tier} users: $_" }
+    } catch { Write-Warning ("T{0} users: {1}" -f $tier, $_.Exception.Message) }
 }
 
 # Role groups
 foreach ($tier in @('T0','T1')) {
     $prefix = $tier
     try {
-        $collect["${tier}Groups"] = @(Get-ADGroup -Filter "Name -like '$prefix-*'" -Properties Members,Description -ErrorAction Stop | Sort-Object Name)
-        Write-Host "  [OK] $($collect["${tier}Groups"].Count) $tier group(s)"
-    } catch { Write-Warning "$tier groups: $_" }
+        $groupKey = '{0}Groups' -f $tier
+        $collect[$groupKey] = @(Invoke-WithRetry -Operation "Get-ADGroup prefix $prefix" -ScriptBlock { Get-ADGroup -Filter "Name -like '$prefix-*'" -Properties Members,Description -ErrorAction Stop | Sort-Object Name })
+        Write-Host ("  [OK] {0} {1} group(s)" -f $collect[$groupKey].Count, $tier)
+    } catch { Write-Warning ("{0} groups: {1}" -f $tier, $_.Exception.Message) }
 }
 
 # Protected Users
 try {
-    $collect.ProtectedUsers = @(Get-ADGroupMember 'Protected Users' -Recursive -ErrorAction Stop |
+    $collect.ProtectedUsers = @(Invoke-WithRetry -Operation 'Get-ADGroupMember Protected Users' -ScriptBlock { Get-ADGroupMember 'Protected Users' -Recursive -ErrorAction Stop } |
         Where-Object { $_.objectClass -eq 'user' } | Select-Object -ExpandProperty SamAccountName)
     Write-Host "  [OK] Protected Users: $($collect.ProtectedUsers.Count) member(s)"
-} catch { Write-Warning "Protected Users: $_" }
+} catch { Write-Warning ("Protected Users: {0}" -f $_.Exception.Message) }
 
 # Domain Admins
 try {
-    $collect.DomainAdmins = @(Get-ADGroupMember 'Domain Admins' -ErrorAction Stop |
+    $collect.DomainAdmins = @(Invoke-WithRetry -Operation 'Get-ADGroupMember Domain Admins' -ScriptBlock { Get-ADGroupMember 'Domain Admins' -ErrorAction Stop } |
         Where-Object { $_.objectClass -eq 'user' })
     Write-Host "  [OK] Domain Admins: $($collect.DomainAdmins.Count) direct user(s)"
-} catch { Write-Warning "Domain Admins: $_" }
+} catch { Write-Warning ("Domain Admins: {0}" -f $_.Exception.Message) }
 
 # PSOs
 try {
-    $collect.PSOs = @(Get-ADFineGrainedPasswordPolicy -Filter * -Properties AppliesTo -ErrorAction Stop | Sort-Object Precedence)
+    $collect.PSOs = @(Invoke-WithRetry -Operation 'Get-ADFineGrainedPasswordPolicy' -ScriptBlock { Get-ADFineGrainedPasswordPolicy -Filter * -Properties AppliesTo -ErrorAction Stop | Sort-Object Precedence })
     Write-Host "  [OK] PSOs: $($collect.PSOs.Count) found"
-} catch { Write-Warning "PSOs: $_" }
+} catch { Write-Warning ("PSOs: {0}" -f $_.Exception.Message) }
 
 # Auth Silos
 try {
-    $collect.Silos = @(Get-ADAuthenticationPolicySilo -Filter * -ErrorAction Stop | Sort-Object Name)
+    $collect.Silos = @(Invoke-WithRetry -Operation 'Get-ADAuthenticationPolicySilo' -ScriptBlock { Get-ADAuthenticationPolicySilo -Filter * -ErrorAction Stop | Sort-Object Name })
     Write-Host "  [OK] Auth Silos: $($collect.Silos.Count) found"
-} catch { Write-Warning "Auth Silos (requires DFL 2012R2+): $_" }
+} catch { Write-Warning ("Auth Silos (requires DFL 2012R2+): {0}" -f $_.Exception.Message) }
 
 # PAW computers (Tier 0 PAWs)
 try {
     $pawBase = "OU=PAWs,OU=Tier 0,$TiersDN"
-    if (Get-ADOrganizationalUnit -Identity $pawBase -ErrorAction SilentlyContinue) {
-        $collect.PAWComputers = @(Get-ADComputer -Filter * -SearchBase $pawBase -Properties Description,LastLogonDate,OperatingSystem -ErrorAction Stop | Sort-Object Name)
+    if (Invoke-WithRetry -Operation "Get-ADOrganizationalUnit $pawBase" -ScriptBlock { Get-ADOrganizationalUnit -Identity $pawBase -ErrorAction SilentlyContinue }) {
+        $collect.PAWComputers = @(Invoke-WithRetry -Operation 'Get-ADComputer PAW inventory' -ScriptBlock { Get-ADComputer -Filter * -SearchBase $pawBase -Properties Description,LastLogonDate,OperatingSystem -ErrorAction Stop | Sort-Object Name })
         Write-Host "  [OK] PAW computers: $($collect.PAWComputers.Count)"
     }
-} catch { Write-Warning "PAW computers: $_" }
+} catch { Write-Warning ("PAW computers: {0}" -f $_.Exception.Message) }
 
 # Break-glass accounts
 $bgSam1 = try { [string]$Cfg.BreakGlass.Account1 } catch { 'brk-glass-01' }
@@ -223,21 +306,23 @@ $bgSam2 = try { [string]$Cfg.BreakGlass.Account2 } catch { 'brk-glass-02' }
 foreach ($bgSam in @($bgSam1, $bgSam2)) {
     if ([string]::IsNullOrWhiteSpace($bgSam)) { continue }
     try {
-        $u = Get-ADUser -Filter "SamAccountName -eq '$bgSam'" `
-            -Properties PasswordLastSet, LastLogonDate, Enabled, PasswordNeverExpires, SmartcardLogonRequired -ErrorAction SilentlyContinue
+        $u = Invoke-WithRetry -Operation "Get-ADUser break-glass $bgSam" -ScriptBlock {
+            Get-ADUser -Filter "SamAccountName -eq '$bgSam'" `
+                -Properties PasswordLastSet, LastLogonDate, Enabled, PasswordNeverExpires, SmartcardLogonRequired -ErrorAction SilentlyContinue
+        }
         if ($u) { $collect.BreakGlass += $u }
-    } catch { Write-Warning "Break-glass $bgSam: $_" }
+    } catch { Write-Warning ("Break-glass {0}: {1}" -f $bgSam, $_.Exception.Message) }
 }
 
 # GPO links to tier OUs
 try {
     Import-Module GroupPolicy -ErrorAction SilentlyContinue
-    $t0Inh = Get-GPInheritance -Target "OU=Tier 0,$TiersDN" -ErrorAction SilentlyContinue
+    $t0Inh = Invoke-WithRetry -Operation 'Get-GPInheritance Tier 0' -ScriptBlock { Get-GPInheritance -Target "OU=Tier 0,$TiersDN" -ErrorAction SilentlyContinue }
     if ($t0Inh) { $collect.T0GPOLinks = @($t0Inh.GpoLinks) }
-    $t1Inh = Get-GPInheritance -Target "OU=Tier 1,$TiersDN" -ErrorAction SilentlyContinue
+    $t1Inh = Invoke-WithRetry -Operation 'Get-GPInheritance Tier 1' -ScriptBlock { Get-GPInheritance -Target "OU=Tier 1,$TiersDN" -ErrorAction SilentlyContinue }
     if ($t1Inh) { $collect.T1GPOLinks = @($t1Inh.GpoLinks) }
     Write-Host "  [OK] GPO links: T0=$($collect.T0GPOLinks.Count) T1=$($collect.T1GPOLinks.Count)"
-} catch { Write-Warning "GPO links: $_" }
+} catch { Write-Warning ("GPO links: {0}" -f $_.Exception.Message) }
 
 # ─── Compliance checks ────────────────────────────────────────────────────────
 Write-Host '[INFO] Running compliance checks...' -ForegroundColor Cyan
@@ -375,21 +460,21 @@ $css = @'
 </style>
 '@
 
-function Badge-Status([string]$s) {
+function Get-StatusBadge([string]$s) {
     $cls = switch ($s) { 'PASS' {'b-pass'} 'FAIL' {'b-fail'} 'WARN' {'b-warn'} default {'b-info'} }
     "<span class='b $cls'>$s</span>"
 }
-function Badge-Tier([string]$t) {
+function Get-TierBadge([string]$t) {
     $cls = switch ($t) { 'T0' {'b-t0'} 'T1' {'b-t1'} 'T2' {'b-t2'} default {'b-na'} }
     "<span class='b $cls'>$t</span>"
 }
-function Fmt-Date($d, [switch]$FlagOld) {
+function Format-DisplayDate($d, [switch]$FlagOld) {
     if ($null -eq $d) { return "<span class='bad'>Never</span>" }
     $s = $d.ToString('yyyy-MM-dd')
     if ($FlagOld -and $d -lt $staleDate) { return "<span class='bad'>$s &#9888;</span>" }
     return $s
 }
-function Fmt-Bool($v, [switch]$InvertBad) {
+function Format-DisplayBool($v, [switch]$InvertBad) {
     if ($v) { return $(if (-not $InvertBad) { "<span class='ok'>Yes</span>" } else { "<span class='bad'>Yes &#9888;</span>" }) }
     return   $(if (-not $InvertBad) { "<span class='bad'>No &#9888;</span>" } else { "<span class='ok'>No</span>" })
 }
@@ -405,11 +490,11 @@ function Build-UserTable([array]$Users) {
         [void]$sb.Append("<tr$rowClass>")
         [void]$sb.Append("<td>$(Esc $u.SamAccountName)</td>")
         [void]$sb.Append("<td>$(Esc ([string]$u.DisplayName))</td>")
-        [void]$sb.Append("<td>$(Fmt-Bool $u.Enabled)</td>")
-        [void]$sb.Append("<td>$(Fmt-Date $u.LastLogonDate -FlagOld)</td>")
-        [void]$sb.Append("<td>$(Fmt-Date $u.PasswordLastSet)</td>")
-        [void]$sb.Append("<td>$(Fmt-Bool $u.SmartcardLogonRequired)</td>")
-        [void]$sb.Append("<td>$(Fmt-Bool $inPU)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayBool $u.Enabled)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayDate $u.LastLogonDate -FlagOld)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayDate $u.PasswordLastSet)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayBool $u.SmartcardLogonRequired)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayBool $inPU)</td>")
         [void]$sb.Append("<td>$(Esc $ouPart)</td></tr>")
     }
     [void]$sb.Append("</table>")
@@ -439,7 +524,7 @@ function Build-PSOCards([array]$PSOs) {
     [void]$sb.Append("<div class='pso-grid'>")
     foreach ($p in $PSOs) {
         $tier = if ($p.Name -match 'Tier0') {'T0'} elseif ($p.Name -match 'Tier1') {'T1'} elseif ($p.Name -match 'Tier2') {'T2'} else {'SA'}
-        [void]$sb.Append("<div class='pso-card'><h4>$(Esc $p.Name) $(Badge-Tier $tier)</h4><dl>")
+        [void]$sb.Append("<div class='pso-card'><h4>$(Esc $p.Name) $(Get-TierBadge $tier)</h4><dl>")
         [void]$sb.Append("<dt>Precedence</dt><dd>$($p.Precedence)</dd>")
         [void]$sb.Append("<dt>Min Length</dt><dd>$($p.MinPasswordLength)</dd>")
         [void]$sb.Append("<dt>Max Age</dt><dd>$(if ($p.MaxPasswordAge.TotalDays -gt 36000) {'No max'} else {"$([int]$p.MaxPasswordAge.TotalDays) days"})</dd>")
@@ -463,7 +548,7 @@ function Build-ComplianceTable([System.Collections.Generic.List[hashtable]]$Chec
         $rowCls = switch ($c.Status) { 'PASS' {'comp-pass'} 'FAIL' {'comp-fail'} default {'comp-warn'} }
         [void]$sb.Append("<tr class='$rowCls'>")
         [void]$sb.Append("<td>$(Esc $c.Name)</td>")
-        [void]$sb.Append("<td>$(Badge-Status $c.Status)</td>")
+        [void]$sb.Append("<td>$(Get-StatusBadge $c.Status)</td>")
         [void]$sb.Append("<td>$(Esc $c.Detail)</td></tr>")
     }
     [void]$sb.Append("</table>")
@@ -477,8 +562,8 @@ function Build-GPOTable([array]$Links) {
     foreach ($lnk in ($Links | Sort-Object Order)) {
         [void]$sb.Append("<tr>")
         [void]$sb.Append("<td>$(Esc $lnk.DisplayName)</td>")
-        [void]$sb.Append("<td>$(Fmt-Bool $lnk.Enabled)</td>")
-        [void]$sb.Append("<td>$(Fmt-Bool $lnk.Enforced -InvertBad)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayBool $lnk.Enabled)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayBool $lnk.Enforced -InvertBad)</td>")
         [void]$sb.Append("<td>$($lnk.Order)</td></tr>")
     }
     [void]$sb.Append("</table>")
@@ -491,7 +576,7 @@ function Build-SiloTable([array]$Silos) {
     [void]$sb.Append("<table><tr><th>Silo Name</th><th>Enforced</th></tr>")
     foreach ($silo in $Silos) {
         [void]$sb.Append("<tr><td>$(Esc $silo.Name)</td>")
-        [void]$sb.Append("<td>$(Fmt-Bool $silo.Enforce)</td></tr>")
+        [void]$sb.Append("<td>$(Format-DisplayBool $silo.Enforce)</td></tr>")
     }
     [void]$sb.Append("</table>")
     return $sb.ToString()
@@ -505,7 +590,7 @@ function Build-PAWTable([array]$PAWs) {
         [void]$sb.Append("<tr>")
         [void]$sb.Append("<td>$(Esc $c.Name)</td>")
         [void]$sb.Append("<td>$(Esc ([string]$c.OperatingSystem))</td>")
-        [void]$sb.Append("<td>$(Fmt-Date $c.LastLogonDate -FlagOld)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayDate $c.LastLogonDate -FlagOld)</td>")
         [void]$sb.Append("<td>$(Esc ([string]$c.Description))</td></tr>")
     }
     [void]$sb.Append("</table>")
@@ -521,11 +606,11 @@ function Build-BreakGlassTable([array]$Accounts) {
         $recentLogon = $null -ne $u.LastLogonDate -and $u.LastLogonDate -gt (Get-Date).AddDays(-30)
         [void]$sb.Append("<tr>")
         [void]$sb.Append("<td>$(Esc $u.SamAccountName)</td>")
-        [void]$sb.Append("<td>$(Fmt-Bool $u.Enabled)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayBool $u.Enabled)</td>")
         $logonClass = if ($recentLogon) { " class='bad'" } else { '' }
-        [void]$sb.Append("<td$logonClass>$(Fmt-Date $u.LastLogonDate)$(if ($recentLogon) {' &#9888; USED RECENTLY'} else {''})</td>")
-        [void]$sb.Append("<td>$(Fmt-Date $u.PasswordLastSet)</td>")
-        [void]$sb.Append("<td>$(Fmt-Bool $u.PasswordNeverExpires -InvertBad)</td>")
+        [void]$sb.Append("<td$logonClass>$(Format-DisplayDate $u.LastLogonDate)$(if ($recentLogon) {' &#9888; USED RECENTLY'} else {''})</td>")
+        [void]$sb.Append("<td>$(Format-DisplayDate $u.PasswordLastSet)</td>")
+        [void]$sb.Append("<td>$(Format-DisplayBool $u.PasswordNeverExpires -InvertBad)</td>")
         # Break-glass should NOT require smartcard (can't use smartcard in recovery scenario)
         [void]$sb.Append("<td>$(if (-not $u.SmartcardLogonRequired) { "<span class='ok'>No (correct)</span>" } else { "<span class='warn-c'>Yes &#9888;</span>" })</td>")
         [void]$sb.Append("</tr>")
@@ -711,7 +796,7 @@ $html = @"
 "@
 
 # ─── Write report ─────────────────────────────────────────────────────────────
-$html | Set-Content -Path $OutputPath -Encoding UTF8
+$html | Set-TextFileContent -FilePath $OutputPath
 $absPath = (Resolve-Path $OutputPath).Path
 Write-Host ''
 Write-Host "[OK] Report written: $absPath" -ForegroundColor Green
@@ -723,7 +808,7 @@ Write-Host "     Stale total : $totalStale"
 Write-Host ''
 
 if ($OpenInBrowser) {
-    Start-Process $absPath
+    Start-Process -FilePath $absPath
 }
 
 # ─── Return structured result for pipeline use ────────────────────────────────

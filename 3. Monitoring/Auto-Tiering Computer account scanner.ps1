@@ -46,6 +46,40 @@ $script:RunReport = [ordered]@{
 
 $script:TelemetryCache = @{}
 $script:MoveIndex = @{}
+$script:QueryTuning = [ordered]@{
+    RetryCount = 2
+    RetryDelaySeconds = 2
+    CimOperationTimeoutSeconds = 15
+    EventQueryTimeoutSeconds = 20
+}
+
+function Get-EnvironmentVariableValue {
+    param([Parameter(Mandatory)][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return $null
+    }
+
+    foreach ($scope in @('Process', 'User', 'Machine')) {
+        $value = [System.Environment]::GetEnvironmentVariable($Name, $scope)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value
+        }
+    }
+
+    return $null
+}
+
+function Test-HttpsUrl {
+    param([Parameter(Mandatory)][string]$Url)
+
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$uri)) {
+        return $false
+    }
+
+    return $uri.Scheme -eq [System.Uri]::UriSchemeHttps
+}
 
 function Write-Log {
     param(
@@ -67,6 +101,161 @@ function Add-RunError {
     param([string]$Message)
     $script:RunReport.Errors += $Message
     Write-Log $Message ERROR
+}
+
+function Get-OptionalIntValue {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$PropertyName,
+        [Parameter(Mandatory)][int]$DefaultValue
+    )
+
+    if ($null -eq $Object -or -not $Object.PSObject.Properties.Name.Contains($PropertyName)) {
+        return $DefaultValue
+    }
+
+    $raw = [string]$Object.$PropertyName
+    $parsed = 0
+    if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -ge 0) {
+        return $parsed
+    }
+
+    return $DefaultValue
+}
+
+function Initialize-QueryTuning {
+    param($Config)
+
+    $settings = $null
+    if ($Config.PSObject.Properties.Name.Contains('queryTuning')) {
+        $settings = $Config.queryTuning
+    }
+
+    $script:QueryTuning = [ordered]@{
+        RetryCount = Get-OptionalIntValue -Object $settings -PropertyName 'retryCount' -DefaultValue 2
+        RetryDelaySeconds = Get-OptionalIntValue -Object $settings -PropertyName 'retryDelaySeconds' -DefaultValue 2
+        CimOperationTimeoutSeconds = Get-OptionalIntValue -Object $settings -PropertyName 'cimOperationTimeoutSeconds' -DefaultValue 15
+        EventQueryTimeoutSeconds = Get-OptionalIntValue -Object $settings -PropertyName 'eventQueryTimeoutSeconds' -DefaultValue 20
+    }
+}
+
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory)][string]$Operation,
+        [int]$RetryCount = -1,
+        [int]$RetryDelaySeconds = -1
+    )
+
+    if ($RetryCount -lt 0) {
+        $RetryCount = [int]$script:QueryTuning.RetryCount
+    }
+    if ($RetryDelaySeconds -lt 0) {
+        $RetryDelaySeconds = [int]$script:QueryTuning.RetryDelaySeconds
+    }
+
+    $attempt = 0
+    while ($true) {
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            if ($attempt -ge $RetryCount) {
+                throw
+            }
+
+            $attempt++
+            Add-RunWarning "$Operation failed on attempt $attempt. Retrying in $RetryDelaySeconds second(s): $($_.Exception.Message)"
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+    }
+}
+
+function Invoke-JobWithTimeoutAndRetry {
+    param(
+        [Parameter(Mandatory)][scriptblock]$JobScriptBlock,
+        [Parameter(Mandatory)][object[]]$ArgumentList,
+        [Parameter(Mandatory)][string]$Operation,
+        [int]$TimeoutSeconds,
+        [int]$RetryCount = -1,
+        [int]$RetryDelaySeconds = -1
+    )
+
+    if ($TimeoutSeconds -le 0) {
+        throw 'TimeoutSeconds must be greater than zero.'
+    }
+    if ($RetryCount -lt 0) {
+        $RetryCount = [int]$script:QueryTuning.RetryCount
+    }
+    if ($RetryDelaySeconds -lt 0) {
+        $RetryDelaySeconds = [int]$script:QueryTuning.RetryDelaySeconds
+    }
+
+    $attempt = 0
+    while ($true) {
+        $job = Start-Job -ScriptBlock $JobScriptBlock -ArgumentList $ArgumentList
+        try {
+            if (-not (Wait-Job -Job $job -Timeout $TimeoutSeconds)) {
+                Stop-Job -Job $job -Force | Out-Null
+                throw "$Operation timed out after $TimeoutSeconds second(s)."
+            }
+
+            return Receive-Job -Job $job -ErrorAction Stop
+        }
+        catch {
+            if ($attempt -ge $RetryCount) {
+                throw
+            }
+
+            $attempt++
+            Add-RunWarning "$Operation failed on attempt $attempt. Retrying in $RetryDelaySeconds second(s): $($_.Exception.Message)"
+            Start-Sleep -Seconds $RetryDelaySeconds
+        }
+        finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
+function Get-CimDataWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string]$ClassName,
+        [string[]]$Property
+    )
+
+    $timeoutSeconds = [int]$script:QueryTuning.CimOperationTimeoutSeconds
+    return Invoke-WithRetry -Operation "Get-CimInstance $ClassName on $ComputerName" -ScriptBlock {
+        if ($Property) {
+            Get-CimInstance -ClassName $ClassName -ComputerName $ComputerName -Property $Property -OperationTimeoutSec $timeoutSeconds -ErrorAction Stop
+        }
+        else {
+            Get-CimInstance -ClassName $ClassName -ComputerName $ComputerName -OperationTimeoutSec $timeoutSeconds -ErrorAction Stop
+        }
+    }
+}
+
+function Get-WinEventWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][hashtable]$FilterHashtable,
+        [Parameter(Mandatory)][int]$MaxEvents,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    return Invoke-JobWithTimeoutAndRetry -Operation $Operation -TimeoutSeconds ([int]$script:QueryTuning.EventQueryTimeoutSeconds) -ArgumentList @($ComputerName, $FilterHashtable, $MaxEvents) -JobScriptBlock {
+        param($RemoteComputerName, $RemoteFilterHashtable, $RemoteMaxEvents)
+        Get-WinEvent -ComputerName $RemoteComputerName -FilterHashtable $RemoteFilterHashtable -MaxEvents $RemoteMaxEvents -ErrorAction Stop
+    }
+}
+
+function Invoke-AdQueryWithRetry {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    Invoke-WithRetry -Operation $Operation -ScriptBlock $ScriptBlock
 }
 
 function Invoke-Phase {
@@ -117,10 +306,10 @@ function Invoke-Phase {
 
 function Resolve-ConfigObject {
     if ($PSCmdlet.ParameterSetName -eq 'ConfigFile') {
-        if (-not (Test-Path $ConfigPath)) {
+        if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
             throw "Config file not found: $ConfigPath"
         }
-        $raw = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
+        $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
         $script:RunReport.ConfigSource = "file:$ConfigPath"
     }
     else {
@@ -192,21 +381,217 @@ function Assert-Config {
         }
     }
 
-    $requiredAlert = @('enabled', 'to', 'from', 'smtpServer')
+    $requiredAlert = @('enabled', 'mode')
     foreach ($a in $requiredAlert) {
         if (-not $Cfg.alert.PSObject.Properties.Name.Contains($a)) {
             throw "Config.alert missing '$a'."
         }
     }
+
+    if ([bool]$Cfg.alert.enabled) {
+        if ([string]$Cfg.alert.mode -ne 'webhook') {
+            throw "Config.alert.mode must be 'webhook' when alerting is enabled."
+        }
+
+        $hasInlineWebhook = $Cfg.alert.PSObject.Properties.Name.Contains('webhookUrl') -and -not [string]::IsNullOrWhiteSpace([string]$Cfg.alert.webhookUrl)
+        $hasEnvWebhook = $Cfg.alert.PSObject.Properties.Name.Contains('webhookUrlEnvVar') -and -not [string]::IsNullOrWhiteSpace([string]$Cfg.alert.webhookUrlEnvVar)
+        if (-not ($hasInlineWebhook -or $hasEnvWebhook)) {
+            throw "Config.alert requires webhookUrl or webhookUrlEnvVar when enabled."
+        }
+
+        if ($hasInlineWebhook -and -not (Test-HttpsUrl -Url ([string]$Cfg.alert.webhookUrl))) {
+            throw 'Config.alert.webhookUrl must use an absolute https:// URL.'
+        }
+    }
 }
 
-function Ensure-DirectoryForFile {
+function New-DirectoryForFile {
     param([Parameter(Mandatory)][string]$FilePath)
 
-    $dir = Split-Path -Parent $FilePath
-    if ($dir -and -not (Test-Path $dir)) {
+    $dir = Split-Path -LiteralPath $FilePath -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         New-Item -Path $dir -ItemType Directory -Force | Out-Null
     }
+}
+
+function Set-TextFileContent {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [AllowEmptyString()][Parameter(Mandatory)]$Value
+    )
+
+    New-DirectoryForFile -FilePath $FilePath
+    Set-Content -LiteralPath $FilePath -Value $Value -Encoding UTF8
+}
+
+function ConvertTo-HashtableDeep {
+    param([Parameter(Mandatory)]$InputObject)
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $ht = @{}
+        foreach ($key in $InputObject.Keys) {
+            $ht[$key] = ConvertTo-HashtableDeep -InputObject $InputObject[$key]
+        }
+        return $ht
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) {
+        $items = @()
+        foreach ($item in $InputObject) {
+            $items += ,(ConvertTo-HashtableDeep -InputObject $item)
+        }
+        return $items
+    }
+
+    if ($InputObject.PSObject -and $InputObject.PSObject.Properties.Count -gt 0) {
+        $ht = @{}
+        foreach ($prop in $InputObject.PSObject.Properties) {
+            $ht[$prop.Name] = ConvertTo-HashtableDeep -InputObject $prop.Value
+        }
+        return $ht
+    }
+
+    return $InputObject
+}
+
+function Resolve-AlertWebhookUrl {
+    param([Parameter(Mandatory)]$AlertConfig)
+
+    if ($AlertConfig.PSObject.Properties.Name.Contains('webhookUrlEnvVar')) {
+        $urlFromEnv = Get-EnvironmentVariableValue -Name ([string]$AlertConfig.webhookUrlEnvVar)
+        if (-not [string]::IsNullOrWhiteSpace($urlFromEnv)) {
+            return $urlFromEnv
+        }
+    }
+
+    if ($AlertConfig.PSObject.Properties.Name.Contains('webhookUrl') -and -not [string]::IsNullOrWhiteSpace([string]$AlertConfig.webhookUrl)) {
+        $url = [string]$AlertConfig.webhookUrl
+        if (-not (Test-HttpsUrl -Url $url)) {
+            throw 'Alert webhook URL must use an absolute https:// URL.'
+        }
+
+        return $url
+    }
+
+    throw 'Alert webhook URL not provided. Set config.alert.webhookUrlEnvVar or config.alert.webhookUrl.'
+}
+
+function Test-AlertPreFlight {
+    param([Parameter(Mandatory)]$AlertConfig)
+
+    if (-not [bool]$AlertConfig.enabled) {
+        return
+    }
+
+    $resolvedWebhookUrl = Resolve-AlertWebhookUrl -AlertConfig $AlertConfig
+    if (-not (Test-HttpsUrl -Url $resolvedWebhookUrl)) {
+        throw 'Alert webhook URL must use an absolute https:// URL.'
+    }
+
+    if ($AlertConfig.PSObject.Properties.Name.Contains('webhookUrlEnvVar')) {
+        $webhookEnvVarName = [string]$AlertConfig.webhookUrlEnvVar
+        if (-not [string]::IsNullOrWhiteSpace($webhookEnvVarName)) {
+            $webhookEnvValue = Get-EnvironmentVariableValue -Name $webhookEnvVarName
+            if ([string]::IsNullOrWhiteSpace($webhookEnvValue) -and -not ($AlertConfig.PSObject.Properties.Name.Contains('webhookUrl') -and -not [string]::IsNullOrWhiteSpace([string]$AlertConfig.webhookUrl))) {
+                throw "Alert webhook URL environment variable '$webhookEnvVarName' is not set."
+            }
+        }
+    }
+
+    if ($AlertConfig.PSObject.Properties.Name.Contains('authorizationEnvVar')) {
+        $authEnvVarName = [string]$AlertConfig.authorizationEnvVar
+        if (-not [string]::IsNullOrWhiteSpace($authEnvVarName)) {
+            $authEnvValue = Get-EnvironmentVariableValue -Name $authEnvVarName
+            if ([string]::IsNullOrWhiteSpace($authEnvValue)) {
+                Add-RunWarning "Alert authorization environment variable '$authEnvVarName' is not set. Requests will be sent without an Authorization header."
+            }
+        }
+    }
+}
+
+function Get-AlertHeaders {
+    param([Parameter(Mandatory)]$AlertConfig)
+
+    $headers = @{}
+
+    if ($AlertConfig.PSObject.Properties.Name.Contains('headers') -and $AlertConfig.headers) {
+        $configuredHeaders = ConvertTo-HashtableDeep -InputObject $AlertConfig.headers
+        foreach ($key in $configuredHeaders.Keys) {
+            $headers[[string]$key] = [string]$configuredHeaders[$key]
+        }
+    }
+
+    if ($AlertConfig.PSObject.Properties.Name.Contains('authorizationEnvVar')) {
+        $authValue = Get-EnvironmentVariableValue -Name ([string]$AlertConfig.authorizationEnvVar)
+        if (-not [string]::IsNullOrWhiteSpace($authValue)) {
+            $headers.Authorization = $authValue
+        }
+    }
+
+    return $headers
+}
+
+function Invoke-AlertWebhook {
+    param(
+        [Parameter(Mandatory)]$AlertConfig,
+        [Parameter(Mandatory)][string]$ReportPath,
+        [Parameter(Mandatory)]$RunReport,
+        [Parameter(Mandatory)][array]$Findings,
+        [Parameter(Mandatory)][int]$MisplacementCount,
+        [Parameter(Mandatory)][int]$HighRiskMoveCount
+    )
+
+    $webhookUrl = Resolve-AlertWebhookUrl -AlertConfig $AlertConfig
+    $headers = Get-AlertHeaders -AlertConfig $AlertConfig
+    $topFindings = @($Findings | Select-Object -First 10 | ForEach-Object {
+        [ordered]@{
+            objectName = $_.ObjectName
+            currentTier = $_.CurrentTier
+            expectedTier = $_.ExpectedTier
+            moveRisk = $_.MoveRisk
+            confidenceDelta = $_.ConfidenceDelta
+            issue = $_.Issue
+            fix = $_.Fix
+        }
+    })
+
+    $payload = [ordered]@{
+        title = 'MEAM Tier Violation Alert'
+        generatedAt = (Get-Date).ToString('o')
+        summary = [ordered]@{
+            computersScanned = $RunReport.Totals.ComputersScanned
+            misplacements = $MisplacementCount
+            highRiskMoves = $HighRiskMoveCount
+            unclassified = $RunReport.Totals.Unclassified
+            assessmentErrors = $RunReport.Totals.AssessmentErrors
+        }
+        reportPath = $ReportPath
+        runReportPath = $RunReport.Outputs.RunReportPath
+        phaseCsvPath = $RunReport.Outputs.PhaseCsvPath
+        topFindings = $topFindings
+    }
+
+    $timeoutSeconds = 30
+    if ($AlertConfig.PSObject.Properties.Name.Contains('timeoutSeconds') -and $AlertConfig.timeoutSeconds) {
+        $timeoutSeconds = [int]$AlertConfig.timeoutSeconds
+    }
+
+    $requestParams = @{
+        Uri = $webhookUrl
+        Method = 'Post'
+        ContentType = 'application/json'
+        Body = ($payload | ConvertTo-Json -Depth 8)
+        TimeoutSec = $timeoutSeconds
+    }
+    if ($headers.Count -gt 0) {
+        $requestParams.Headers = $headers
+    }
+
+    Invoke-RestMethod @requestParams | Out-Null
 }
 
 function Get-CurrentTierFromDN {
@@ -233,11 +618,11 @@ function Add-Score {
 }
 
 function Get-EventDataMap {
-    param([System.Diagnostics.Eventing.Reader.EventRecord]$Event)
+    param([System.Diagnostics.Eventing.Reader.EventRecord]$EventRecord)
 
     $map = @{}
     try {
-        $xml = [xml]$Event.ToXml()
+        $xml = [xml]$EventRecord.ToXml()
         foreach ($d in $xml.Event.EventData.Data) {
             $name = [string]$d.Name
             if ([string]::IsNullOrWhiteSpace($name)) { continue }
@@ -259,10 +644,10 @@ function Test-RecentEvent {
     )
 
     try {
-        $evt = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
+        $evt = Get-WinEventWithRetry -ComputerName $ComputerName -FilterHashtable @{
             LogName = $LogName
             StartTime = $StartTime
-        } -MaxEvents $MaxEvents -ErrorAction Stop
+        } -MaxEvents $MaxEvents -Operation "Get-WinEvent $LogName on $ComputerName"
         return [bool]$evt
     }
     catch {
@@ -291,11 +676,11 @@ function Get-ComputerTelemetry {
     }
 
     try {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName -ErrorAction Stop
+        $os = Get-CimDataWithRetry -ClassName Win32_OperatingSystem -ComputerName $ComputerName
         $telemetry.IsServerOS = ($os.ProductType -ne 1)
 
         if ([bool]$Signals.useRoleSignals) {
-            $svc = Get-CimInstance -ClassName Win32_Service -ComputerName $ComputerName -ErrorAction Stop |
+            $svc = Get-CimDataWithRetry -ClassName Win32_Service -ComputerName $ComputerName |
                 Select-Object -ExpandProperty Name
             $telemetry.ServiceNames = @($svc)
         }
@@ -354,11 +739,11 @@ function Build-MoveEventIndex {
     )
 
     $index = @{}
-    $events = Get-WinEvent -ComputerName $Server -FilterHashtable @{
+    $events = Get-WinEventWithRetry -ComputerName $Server -FilterHashtable @{
         LogName = 'Security'
         Id = 5139
         StartTime = $StartTime
-    } -MaxEvents $MaxEvents -ErrorAction Stop
+    } -MaxEvents $MaxEvents -Operation "Get security move events from $Server"
 
     foreach ($evt in $events) {
         $data = Get-EventDataMap -Event $evt
@@ -387,7 +772,7 @@ function Build-MoveEventIndex {
     return $index
 }
 
-function To-StringArray {
+function ConvertTo-StringArray {
     param($Value)
 
     if ($null -eq $Value) { return @() }
@@ -402,10 +787,10 @@ function Convert-TierSignals {
     foreach ($tier in @('Tier 0', 'Tier 1', 'Tier 2')) {
         $item = $TierSignalsObject.$tier
         $result[$tier] = @{
-            NamePatterns = To-StringArray $item.NamePatterns
-            GroupPatterns = To-StringArray $item.GroupPatterns
-            DescriptionPatterns = To-StringArray $item.DescriptionPatterns
-            SpnPatterns = To-StringArray $item.SpnPatterns
+            NamePatterns = ConvertTo-StringArray $item.NamePatterns
+            GroupPatterns = ConvertTo-StringArray $item.GroupPatterns
+            DescriptionPatterns = ConvertTo-StringArray $item.DescriptionPatterns
+            SpnPatterns = ConvertTo-StringArray $item.SpnPatterns
         }
     }
     return $result
@@ -608,12 +993,12 @@ function Get-TierAssessment {
 
 $cfg = $null
 $domainDN = $null
-$zoneOUs = $null
-$tierSignals = $null
-$targetOUByTier = $null
-$weights = $null
-$signals = $null
-$alertCfg = $null
+$script:zoneOUs = $null
+$script:tierSignals = $null
+$script:targetOUByTier = $null
+$script:weights = $null
+$script:signals = $null
+$script:alertCfg = $null
 
 $computers = @()
 $results = @()
@@ -624,13 +1009,14 @@ $highRiskMoves = @()
 Invoke-Phase -Name 'Load Configuration' -Block {
     $cfg = Resolve-ConfigObject
     Assert-Config -Cfg $cfg
+    Initialize-QueryTuning -Config $cfg
 
-    $zoneOUs = Convert-ZoneOUs -ZoneOUsObject $cfg.zoneOUs
-    $tierSignals = Convert-TierSignals -TierSignalsObject $cfg.tierSignals
-    $targetOUByTier = Convert-TargetOUs -TargetObject $cfg.targetOUByTier
-    $weights = Convert-Weights -WeightsObject $cfg.weights
-    $signals = $cfg.signals
-    $alertCfg = $cfg.alert
+    $script:zoneOUs = Convert-ZoneOUs -ZoneOUsObject $cfg.zoneOUs
+    $script:tierSignals = Convert-TierSignals -TierSignalsObject $cfg.tierSignals
+    $script:targetOUByTier = Convert-TargetOUs -TargetObject $cfg.targetOUByTier
+    $script:weights = Convert-Weights -WeightsObject $cfg.weights
+    $script:signals = $cfg.signals
+    $script:alertCfg = $cfg.alert
 
     $domainDN = if ($cfg.PSObject.Properties.Name.Contains('domainDN') -and -not [string]::IsNullOrWhiteSpace([string]$cfg.domainDN)) {
         [string]$cfg.domainDN
@@ -648,13 +1034,13 @@ Invoke-Phase -Name 'Load Configuration' -Block {
     else {
         $base = [System.IO.Path]::GetFileNameWithoutExtension([string]$cfg.runReportPath)
         $dir = Split-Path -Parent ([string]$cfg.runReportPath)
-        Join-Path $dir "$base-phases.csv"
+        Join-Path $dir "${base}-phases.csv"
     }
     $script:RunReport.Outputs.PhaseCsvPath = $phaseCsvPath
 
-    Ensure-DirectoryForFile -FilePath ([string]$cfg.reportPath)
-    Ensure-DirectoryForFile -FilePath ([string]$cfg.runReportPath)
-    Ensure-DirectoryForFile -FilePath $phaseCsvPath
+    New-DirectoryForFile -FilePath ([string]$cfg.reportPath)
+    New-DirectoryForFile -FilePath ([string]$cfg.runReportPath)
+    New-DirectoryForFile -FilePath $phaseCsvPath
 } -ContinueOnError:$false
 
 if ($LintConfigOnly) {
@@ -685,23 +1071,27 @@ Invoke-Phase -Name 'Pre-Flight Checks' -Block {
         throw 'ActiveDirectory module is required.'
     }
 
-    if ([bool]$signals.useMoveSignals) {
-        $moveEventServer = if ($signals.PSObject.Properties.Name.Contains('moveEventServer') -and -not [string]::IsNullOrWhiteSpace([string]$signals.moveEventServer)) {
-            [string]$signals.moveEventServer
+    Test-AlertPreFlight -AlertConfig $script:alertCfg
+
+    if ([bool]$script:signals.useMoveSignals) {
+        $moveEventServer = if ($script:signals.PSObject.Properties.Name.Contains('moveEventServer') -and -not [string]::IsNullOrWhiteSpace([string]$script:signals.moveEventServer)) {
+            [string]$script:signals.moveEventServer
         }
         else {
-            (Get-ADDomain).PDCEmulator
+            (Invoke-AdQueryWithRetry -Operation 'Get-ADDomain for move event server' -ScriptBlock { (Get-ADDomain).PDCEmulator })
         }
 
-        $moveStart = (Get-Date).AddDays(-1 * [math]::Abs([int]$signals.moveLookbackDays))
-        $script:MoveIndex = Build-MoveEventIndex -Server $moveEventServer -StartTime $moveStart -MaxEvents ([int]$signals.moveEventMax) -ZoneOUs $zoneOUs
-        Write-Log "Move signal index loaded from $moveEventServer: $($script:MoveIndex.Count) entries" INFO
+        $moveStart = (Get-Date).AddDays(-1 * [math]::Abs([int]$script:signals.moveLookbackDays))
+        $script:MoveIndex = Build-MoveEventIndex -Server $moveEventServer -StartTime $moveStart -MaxEvents ([int]$script:signals.moveEventMax) -ZoneOUs $script:zoneOUs
+        Write-Log ("Move signal index loaded from {0}: {1} entries" -f $moveEventServer, $script:MoveIndex.Count) INFO
     }
 } -ContinueOnError
 
 Invoke-Phase -Name 'Collect AD Computers' -Block {
-    $computers = Get-ADComputer -Filter * -Properties DistinguishedName, Description, MemberOf, ServicePrincipalName, PrimaryGroupID |
-        Select-Object Name, DistinguishedName, Description, MemberOf, ServicePrincipalName, PrimaryGroupID
+    $computers = Invoke-AdQueryWithRetry -Operation 'Get-ADComputer inventory' -ScriptBlock {
+        Get-ADComputer -Filter * -Properties DistinguishedName, Description, MemberOf, ServicePrincipalName, PrimaryGroupID |
+            Select-Object Name, DistinguishedName, Description, MemberOf, ServicePrincipalName, PrimaryGroupID
+    }
 
     $script:RunReport.Totals.ComputersScanned = $computers.Count
     Write-Log "Collected $($computers.Count) computer objects" INFO
@@ -716,7 +1106,7 @@ Invoke-Phase -Name 'Assess Tier Placement' -Block {
         Write-Progress -Activity "Scanning $total computers" -PercentComplete (($progress / [math]::Max($total, 1)) * 100)
 
         try {
-            $results += Get-TierAssessment -Computer $comp -ZoneOUs $zoneOUs -TierSignals $tierSignals -TargetOUByTier $targetOUByTier -Weights $weights -Signals $signals
+            $results += Get-TierAssessment -Computer $comp -ZoneOUs $script:zoneOUs -TierSignals $script:tierSignals -TargetOUByTier $script:targetOUByTier -Weights $script:weights -Signals $script:signals
         }
         catch {
             $script:RunReport.Totals.AssessmentErrors++
@@ -752,38 +1142,28 @@ Invoke-Phase -Name 'Export Findings Report' -Block {
     Write-Host "Report: $($cfg.reportPath) ($($misplacements.Count) misplacements, $($unclassified.Count) unclassified, $($highRiskMoves.Count) high-risk moves)" -ForegroundColor $color
 } -ContinueOnError
 
-Invoke-Phase -Name 'Send Alert Email' -Block {
-    if (-not [bool]$alertCfg.enabled) {
+Invoke-Phase -Name 'Send Alert Notification' -Block {
+    if (-not [bool]$script:alertCfg.enabled) {
         Write-Log 'Alerting disabled in config.alert.enabled' INFO
         return
     }
 
+    if ([string]$script:alertCfg.mode -ne 'webhook') {
+        throw "Unsupported alert mode '$($script:alertCfg.mode)'. Only 'webhook' is supported."
+    }
+
     if ($misplacements.Count -gt 0 -or $highRiskMoves.Count -gt 0) {
-        $body = "Found $($misplacements.Count) tier misplacements and $($highRiskMoves.Count) high-risk moves. See $($cfg.reportPath)`n`n" +
-            (($results |
-                Where-Object { (-not $_.Compliant) -or ($_.MoveRisk -eq 'HIGH:Tier0ToTier1') } |
-                Select-Object ObjectName, CurrentTier, ExpectedTier, MoveFromTier, MoveToTier, MoveRisk, ConfidenceDelta, Issue |
-                Format-Table -AutoSize |
-                Out-String))
+        $findings = @($results |
+            Where-Object { (-not $_.Compliant) -or ($_.MoveRisk -eq 'HIGH:Tier0ToTier1') })
 
-        $attachments = @()
-        if (Test-Path ([string]$cfg.reportPath)) { $attachments += [string]$cfg.reportPath }
-        if (Test-Path ([string]$script:RunReport.Outputs.PhaseCsvPath)) { $attachments += [string]$script:RunReport.Outputs.PhaseCsvPath }
+        Invoke-AlertWebhook -AlertConfig $script:alertCfg `
+            -ReportPath ([string]$cfg.reportPath) `
+            -RunReport $script:RunReport `
+            -Findings $findings `
+            -MisplacementCount $misplacements.Count `
+            -HighRiskMoveCount $highRiskMoves.Count
 
-        $mailParams = @{
-            To = [string]$alertCfg.to
-            From = [string]$alertCfg.from
-            Subject = 'MEAM Tier Violation Alert'
-            Body = $body
-            SmtpServer = [string]$alertCfg.smtpServer
-            Priority = 'High'
-        }
-        if ($attachments.Count -gt 0) {
-            $mailParams.Attachments = $attachments
-        }
-
-        Send-MailMessage @mailParams
-        Write-Log 'Alert email sent.' OK
+        Write-Log 'Alert webhook sent.' OK
     }
     else {
         Write-Log 'No actionable findings. Alert not sent.' INFO
@@ -794,7 +1174,7 @@ Invoke-Phase -Name 'Export Run Report' -Block {
     $script:RunReport.EndTime = (Get-Date).ToString('o')
     $script:RunReport.DurationSeconds = [math]::Round(((Get-Date) - [datetime]$script:RunReport.StartTime).TotalSeconds, 2)
 
-    $script:RunReport | ConvertTo-Json -Depth 20 | Set-Content -Path ([string]$cfg.runReportPath) -Encoding UTF8
+    Set-TextFileContent -FilePath ([string]$cfg.runReportPath) -Value ($script:RunReport | ConvertTo-Json -Depth 20)
     $script:RunReport.Phases |
         Select-Object Name, Status, DurationSeconds, StartTime, EndTime, Error |
         Export-Csv -Path ([string]$script:RunReport.Outputs.PhaseCsvPath) -NoTypeInformation -Encoding UTF8

@@ -20,11 +20,17 @@
 .PARAMETER FailOnPhaseError
     Stop on first phase failure.
 
+.PARAMETER Force
+    Skip the interactive approval prompt. Use for unattended executions only.
+
 .EXAMPLE
     .\DNS_seperate.ps1 -ConfigPath .\dns-separation.config.json
 
 .EXAMPLE
     .\DNS_seperate.ps1 -ConfigPath .\dns-separation.config.json -LintConfigOnly
+
+.EXAMPLE
+    .\DNS_seperate.ps1 -ConfigPath .\dns-separation.config.json -Force
 #>
 
 #Requires -RunAsAdministrator
@@ -40,7 +46,8 @@ param(
     [string]$ConfigJson,
 
     [switch]$LintConfigOnly,
-    [switch]$FailOnPhaseError
+    [switch]$FailOnPhaseError,
+    [switch]$Force
 )
 
 Set-StrictMode -Version Latest
@@ -72,6 +79,11 @@ $script:RunReport = [ordered]@{
     }
 }
 
+$script:QueryTuning = [ordered]@{
+    RetryCount = 2
+    RetryDelaySeconds = 2
+}
+
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -92,6 +104,62 @@ function Add-RunError {
     param([Parameter(Mandatory)][string]$Message)
     $script:RunReport.Errors += $Message
     Write-Log $Message ERROR
+}
+
+function Get-OptionalIntValue {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$PropertyName,
+        [Parameter(Mandatory)][int]$DefaultValue
+    )
+
+    if ($null -eq $Object -or -not $Object.PSObject.Properties.Name.Contains($PropertyName)) {
+        return $DefaultValue
+    }
+
+    $parsed = 0
+    if ([int]::TryParse([string]$Object.$PropertyName, [ref]$parsed) -and $parsed -ge 0) {
+        return $parsed
+    }
+
+    return $DefaultValue
+}
+
+function Initialize-QueryTuning {
+    param($Config)
+
+    $settings = $null
+    if ($Config.PSObject.Properties.Name.Contains('queryTuning')) {
+        $settings = $Config.queryTuning
+    }
+
+    $script:QueryTuning = [ordered]@{
+        RetryCount = Get-OptionalIntValue -Object $settings -PropertyName 'retryCount' -DefaultValue 2
+        RetryDelaySeconds = Get-OptionalIntValue -Object $settings -PropertyName 'retryDelaySeconds' -DefaultValue 2
+    }
+}
+
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    $attempt = 0
+    while ($true) {
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            if ($attempt -ge [int]$script:QueryTuning.RetryCount) {
+                throw
+            }
+
+            $attempt++
+            Add-RunWarning "$Operation failed on attempt $attempt. Retrying in $($script:QueryTuning.RetryDelaySeconds) second(s): $($_.Exception.Message)"
+            Start-Sleep -Seconds ([int]$script:QueryTuning.RetryDelaySeconds)
+        }
+    }
 }
 
 function Invoke-Phase {
@@ -142,10 +210,10 @@ function Invoke-Phase {
 
 function Get-ConfigObject {
     if ($PSCmdlet.ParameterSetName -eq 'ConfigFile') {
-        if (-not (Test-Path $ConfigPath)) {
+        if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
             throw "Config file not found: $ConfigPath"
         }
-        $raw = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
+        $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
         $script:RunReport.ConfigSource = "file:${ConfigPath}"
     }
     else {
@@ -172,10 +240,20 @@ function Test-ModuleAvailable {
 function New-DirectoryForFilePath {
     param([Parameter(Mandatory)][string]$FilePath)
 
-    $dir = Split-Path -Parent $FilePath
-    if ($dir -and -not (Test-Path $dir)) {
+    $dir = Split-Path -LiteralPath $FilePath -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         New-Item -Path $dir -ItemType Directory -Force | Out-Null
     }
+}
+
+function Set-TextFileContent {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [AllowEmptyString()][Parameter(Mandatory)]$Value
+    )
+
+    New-DirectoryForFilePath -FilePath $FilePath
+    Set-Content -LiteralPath $FilePath -Value $Value -Encoding UTF8
 }
 
 function Test-ConfigSchema {
@@ -226,7 +304,7 @@ function Test-ConfigSchema {
 function Get-HostIPv4Address {
     param([Parameter(Mandatory)][string]$ComputerName)
 
-    $records = Resolve-DnsName -Name $ComputerName -Type A -ErrorAction Stop
+    $records = Invoke-WithRetry -Operation "Resolve-DnsName $ComputerName" -ScriptBlock { Resolve-DnsName -Name $ComputerName -Type A -ErrorAction Stop }
     $ips = $records | Select-Object -ExpandProperty IPAddress
     if (-not $ips) {
         throw "No A record found for '$ComputerName'."
@@ -245,20 +323,20 @@ function New-BaselineSnapshot {
         [Parameter(Mandatory)][string]$OutPath
     )
 
-    $resolverZones = Get-DnsServerZone -ComputerName $Resolver -ErrorAction SilentlyContinue |
+    $resolverZones = Invoke-WithRetry -Operation "Get-DnsServerZone inventory on $Resolver" -ScriptBlock { Get-DnsServerZone -ComputerName $Resolver -ErrorAction SilentlyContinue } |
         Select-Object ZoneName, ZoneType, IsDsIntegrated, IsReverseLookupZone
-    $resolverForwarders = (Get-DnsServerForwarder -ComputerName $Resolver -ErrorAction SilentlyContinue).IPAddress.IPAddressToString
+    $resolverForwarders = (Invoke-WithRetry -Operation "Get-DnsServerForwarder on $Resolver" -ScriptBlock { Get-DnsServerForwarder -ComputerName $Resolver -ErrorAction SilentlyContinue }).IPAddress.IPAddressToString
 
-    $domainZoneState = Get-DnsServerZone -ComputerName $Resolver -Name $Domain -ErrorAction SilentlyContinue |
+    $domainZoneState = Invoke-WithRetry -Operation "Get-DnsServerZone $Domain on $Resolver" -ScriptBlock { Get-DnsServerZone -ComputerName $Resolver -Name $Domain -ErrorAction SilentlyContinue } |
         Select-Object ZoneName, ZoneType, IsDsIntegrated
     $msdcsZoneName = "_msdcs.$Domain"
-    $msdcsZoneState = Get-DnsServerZone -ComputerName $Resolver -Name $msdcsZoneName -ErrorAction SilentlyContinue |
+    $msdcsZoneState = Invoke-WithRetry -Operation "Get-DnsServerZone $msdcsZoneName on $Resolver" -ScriptBlock { Get-DnsServerZone -ComputerName $Resolver -Name $msdcsZoneName -ErrorAction SilentlyContinue } |
         Select-Object ZoneName, ZoneType, IsDsIntegrated
 
     $dhcpState = @()
     if ($IncludeDhcp -and $DhcpSrv -and $Scopes) {
         foreach ($scope in $Scopes) {
-            $opt = Get-DhcpServerv4OptionValue -ComputerName $DhcpSrv -ScopeId $scope -OptionId 6 -ErrorAction SilentlyContinue
+            $opt = Invoke-WithRetry -Operation "Get-DhcpServerv4OptionValue scope $scope on $DhcpSrv" -ScriptBlock { Get-DhcpServerv4OptionValue -ComputerName $DhcpSrv -ScopeId $scope -OptionId 6 -ErrorAction SilentlyContinue }
             $dnsOpt = $null
             if ($opt) {
                 $dnsOpt = @($opt.Value)
@@ -283,7 +361,7 @@ function New-BaselineSnapshot {
         DhcpScopes = $dhcpState
     }
 
-    $payload | ConvertTo-Json -Depth 8 | Set-Content -Path $OutPath -Encoding UTF8
+    Set-TextFileContent -FilePath $OutPath -Value ($payload | ConvertTo-Json -Depth 8)
     return $OutPath
 }
 
@@ -302,7 +380,7 @@ function Get-ActionPlan {
 
     $items = New-Object System.Collections.Generic.List[string]
 
-    $feature = Get-WindowsFeature -Name DNS -ComputerName $Resolver
+    $feature = Invoke-WithRetry -Operation "Get-WindowsFeature DNS on $Resolver" -ScriptBlock { Get-WindowsFeature -Name DNS -ComputerName $Resolver }
     if (-not $feature.Installed) {
         $items.Add("Install DNS Server role on $Resolver")
     }
@@ -310,7 +388,7 @@ function Get-ActionPlan {
         $items.Add("No role install needed on $Resolver (DNS role already installed)")
     }
 
-    $currentForwarders = (Get-DnsServerForwarder -ComputerName $Resolver -ErrorAction SilentlyContinue).IPAddress.IPAddressToString
+    $currentForwarders = (Invoke-WithRetry -Operation "Get-DnsServerForwarder on $Resolver" -ScriptBlock { Get-DnsServerForwarder -ComputerName $Resolver -ErrorAction SilentlyContinue }).IPAddress.IPAddressToString
     $currentForwarders = @($currentForwarders | Where-Object { $_ })
     if ((@($currentForwarders) -join ',') -ne (@($Upstream) -join ',')) {
         $items.Add("Set resolver upstream forwarders on $Resolver to: $($Upstream -join ', ')")
@@ -320,7 +398,7 @@ function Get-ActionPlan {
     }
 
     foreach ($zoneName in @($Domain, "_msdcs.$Domain")) {
-        $zone = Get-DnsServerZone -ComputerName $Resolver -Name $zoneName -ErrorAction SilentlyContinue
+        $zone = Invoke-WithRetry -Operation "Get-DnsServerZone $zoneName on $Resolver" -ScriptBlock { Get-DnsServerZone -ComputerName $Resolver -Name $zoneName -ErrorAction SilentlyContinue }
         if (-not $zone) {
             $items.Add("Create conditional forwarder '$zoneName' -> $($DcIPs -join ', ')")
             continue
@@ -336,7 +414,7 @@ function Get-ActionPlan {
             continue
         }
 
-        $fwd = Get-DnsServerConditionalForwarderZone -ComputerName $Resolver -Name $zoneName -ErrorAction SilentlyContinue
+        $fwd = Invoke-WithRetry -Operation "Get-DnsServerConditionalForwarderZone $zoneName on $Resolver" -ScriptBlock { Get-DnsServerConditionalForwarderZone -ComputerName $Resolver -Name $zoneName -ErrorAction SilentlyContinue }
         $masters = @()
         if ($fwd) {
             $masters = @($fwd.MasterServers | ForEach-Object { $_.IPAddressToString })
@@ -352,7 +430,7 @@ function Get-ActionPlan {
 
     if ($IncludeDhcp -and $DhcpSrv -and $Scopes) {
         foreach ($scope in $Scopes) {
-            $opt = Get-DhcpServerv4OptionValue -ComputerName $DhcpSrv -ScopeId $scope -OptionId 6 -ErrorAction SilentlyContinue
+            $opt = Invoke-WithRetry -Operation "Get-DhcpServerv4OptionValue scope $scope on $DhcpSrv" -ScriptBlock { Get-DhcpServerv4OptionValue -ComputerName $DhcpSrv -ScopeId $scope -OptionId 6 -ErrorAction SilentlyContinue }
             $currentDns = @()
             if ($opt) {
                 $currentDns = @($opt.Value)
@@ -394,7 +472,22 @@ function Confirm-Execution {
     }
 }
 
+function Test-IsInteractiveSession {
+    if (-not [System.Environment]::UserInteractive) {
+        return $false
+    }
+
+    try {
+        $null = $Host.UI.RawUI
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
 function Set-DnsRoleInstalled {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param([Parameter(Mandatory)][string]$ComputerName)
 
     $feature = Get-WindowsFeature -Name DNS -ComputerName $ComputerName
@@ -410,6 +503,7 @@ function Set-DnsRoleInstalled {
 }
 
 function Set-ConditionalForwarder {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param(
         [Parameter(Mandatory)][string]$DnsServer,
         [Parameter(Mandatory)][string]$ZoneName,
@@ -445,6 +539,7 @@ function Set-ConditionalForwarder {
 }
 
 function Set-ResolverForwarders {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param(
         [Parameter(Mandatory)][string]$DnsServer,
         [Parameter(Mandatory)][string[]]$Forwarders
@@ -457,6 +552,7 @@ function Set-ResolverForwarders {
 }
 
 function Set-DhcpScopesDnsOption {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param(
         [Parameter(Mandatory)][string]$Server,
         [Parameter(Mandatory)][string[]]$ScopeIds,
@@ -484,7 +580,7 @@ function Export-RunArtifacts {
         $script:RunReport.Status = $Status
     }
 
-    $script:RunReport | ConvertTo-Json -Depth 20 | Set-Content -Path $RunReportJsonPath -Encoding UTF8
+    Set-TextFileContent -FilePath $RunReportJsonPath -Value ($script:RunReport | ConvertTo-Json -Depth 20)
     $script:RunReport.Phases |
         Select-Object Name, Status, DurationSeconds, StartTime, EndTime, Error |
         Export-Csv -Path $RunReportPhaseCsvPath -NoTypeInformation -Encoding UTF8
@@ -494,6 +590,7 @@ try {
     Invoke-Phase -Name 'Load And Validate Config' -Block {
         $script:Cfg = Get-ConfigObject
         Test-ConfigSchema -Config $script:Cfg
+        Initialize-QueryTuning -Config $script:Cfg
 
         $script:RunReport.Outputs.RunReportJsonPath = [string]$script:Cfg.outputs.runReportJsonPath
         $script:RunReport.Outputs.RunReportPhaseCsvPath = [string]$script:Cfg.outputs.runReportPhaseCsvPath
@@ -545,14 +642,14 @@ try {
             $script:Resolved.DomainFqdn = [string]$script:Cfg.domainFqdn
         }
         else {
-            $script:Resolved.DomainFqdn = (Get-ADDomain).DNSRoot
+            $script:Resolved.DomainFqdn = (Invoke-WithRetry -Operation 'Get-ADDomain DNSRoot' -ScriptBlock { (Get-ADDomain).DNSRoot })
         }
 
         if ($script:Cfg.PSObject.Properties.Name.Contains('domainControllerIPs') -and @($script:Cfg.domainControllerIPs).Count -gt 0) {
             $script:Resolved.DomainControllerIPs = @($script:Cfg.domainControllerIPs)
         }
         else {
-            $script:Resolved.DomainControllerIPs = Get-ADDomainController -Filter * |
+            $script:Resolved.DomainControllerIPs = Invoke-WithRetry -Operation 'Get-ADDomainController inventory' -ScriptBlock { Get-ADDomainController -Filter * } |
                 Select-Object -ExpandProperty HostName |
                 ForEach-Object { Get-HostIPv4Address -ComputerName $_ } |
                 Select-Object -Unique
@@ -603,7 +700,7 @@ try {
             -ResolverIP $script:Resolved.ResolverIp `
             -AllowAuthoritativeReplace ([bool]$script:Cfg.forceConvertAuthoritativeZone)
 
-        $script:Resolved.Plan | Set-Content -Path ([string]$script:RunReport.Outputs.ChangePlanPath) -Encoding UTF8
+        Set-TextFileContent -FilePath ([string]$script:RunReport.Outputs.ChangePlanPath) -Value $script:Resolved.Plan
         Write-Log "Change plan saved: $($script:RunReport.Outputs.ChangePlanPath)" OK
     } -ContinueOnError:$false
 
@@ -621,7 +718,17 @@ try {
 
     Invoke-Phase -Name 'Approval Gate' -Block {
         $approved = $true
-        if (-not [bool]$script:Cfg.autoApprove) {
+
+        if ($Force) {
+            Write-Log 'Force specified. Skipping execution confirmation.' WARN
+        }
+        elseif ([bool]$script:Cfg.autoApprove) {
+            Write-Log 'autoApprove=true. Skipping execution confirmation.' WARN
+        }
+        elseif (-not (Test-IsInteractiveSession)) {
+            throw 'Approval required but no interactive session is available. Re-run with -Force or set autoApprove=true for unattended execution.'
+        }
+        else {
             $approved = Confirm-Execution -ActionPlan $script:Resolved.Plan
         }
 

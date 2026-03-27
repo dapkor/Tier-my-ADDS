@@ -134,19 +134,123 @@ function Merge-HashtableDeep {
 
 function New-DirectoryForFilePath {
     param([Parameter(Mandatory)][string]$FilePath)
-    $dir = Split-Path -Parent $FilePath
-    if ($dir -and -not (Test-Path $dir)) {
+    $dir = Split-Path -LiteralPath $FilePath -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         New-Item -Path $dir -ItemType Directory -Force | Out-Null
     }
 }
 
+function Set-TextFileContent {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [AllowEmptyString()][Parameter(Mandatory)]$Value,
+        [ValidateSet('UTF8', 'Unicode')][string]$Encoding = 'UTF8'
+    )
+
+    New-DirectoryForFilePath -FilePath $FilePath
+    Set-Content -LiteralPath $FilePath -Value $Value -Encoding $Encoding
+}
+
+function Get-EnvironmentVariableValue {
+    param([Parameter(Mandatory)][string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return $null
+    }
+
+    foreach ($scope in @('Process', 'User', 'Machine')) {
+        $value = [System.Environment]::GetEnvironmentVariable($Name, $scope)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value
+        }
+    }
+
+    return $null
+}
+
+function Resolve-BreakGlassPassword {
+    param(
+        [Parameter(Mandatory)][hashtable]$Cfg,
+        [switch]$RequireSecret
+    )
+
+    $envVarName = [string]$Cfg.BreakGlass.TempPasswordEnvVar
+    $envSecret = Get-EnvironmentVariableValue -Name $envVarName
+    if (-not [string]::IsNullOrWhiteSpace($envSecret)) {
+        return $envSecret
+    }
+
+    $inlineSecret = [string]$Cfg.BreakGlass.TempPassword
+    if (-not [string]::IsNullOrWhiteSpace($inlineSecret)) {
+        return $inlineSecret
+    }
+
+    if ($RequireSecret) {
+        if (-not [string]::IsNullOrWhiteSpace($envVarName)) {
+            throw "Break-glass password not provided. Set environment variable '$envVarName' or populate BreakGlass.TempPassword for lab-only usage."
+        }
+
+        throw 'Break-glass password not provided. Populate BreakGlass.TempPasswordEnvVar or BreakGlass.TempPassword.'
+    }
+
+    return $null
+}
+
+function Get-TestAdminDefinitions {
+    param(
+        [Parameter(Mandatory)][string]$CorpOuDn,
+        [Parameter(Mandatory)][bool]$EnableSmartcard
+    )
+
+    return @(
+        @{ Sam='adm-t0-test01'; GN='Test'; SN='T0Admin01';
+           Path="OU=Accounts,OU=Zone 0A,OU=Tier 0,OU=Tiers,$CorpOuDn";
+           Desc='TEST: Tier 0 / Zone 0A admin'; Groups=@('T0-ROLE-AD-Admins','PAW-T0-Users');
+           PasswordEnvVar='MEAM_TEST_PASSWORD_ADM_T0_TEST01'; Smartcard=$EnableSmartcard },
+
+        @{ Sam='adm-t1-srv01'; GN='Test'; SN='T1SrvAdmin01';
+           Path="OU=Accounts,OU=Zone 1B,OU=Tier 1,OU=Tiers,$CorpOuDn";
+           Desc='TEST: Tier 1 / Zone 1B server admin'; Groups=@('T1-ROLE-Server-Admins','PAW-T1-Users');
+           PasswordEnvVar='MEAM_TEST_PASSWORD_ADM_T1_SRV01'; Smartcard=$EnableSmartcard },
+
+        @{ Sam='adm-t1-dns01'; GN='Test'; SN='T1DnsAdmin01';
+           Path="OU=Accounts,OU=Zone 1C,OU=Tier 1,OU=Tiers,$CorpOuDn";
+           Desc='TEST: Tier 1 / Zone 1C DNS admin'; Groups=@('T1-ROLE-DNS-Admins','PAW-T1-Users');
+           PasswordEnvVar='MEAM_TEST_PASSWORD_ADM_T1_DNS01'; Smartcard=$EnableSmartcard },
+
+        @{ Sam='adm-t2-hd01'; GN='Test'; SN='T2HelpDesk01';
+           Path="OU=Accounts,OU=Zone 2A,OU=Tier 2,OU=Tiers,$CorpOuDn";
+           Desc='TEST: Tier 2 / Zone 2A helpdesk'; Groups=@('T2-ROLE-HelpDesk','PAW-T2-Users');
+           PasswordEnvVar='MEAM_TEST_PASSWORD_ADM_T2_HD01'; Smartcard=$false }
+    )
+}
+
+function Resolve-TestAccountPassword {
+    param(
+        [Parameter(Mandatory)][hashtable]$Account,
+        [switch]$RequireSecret
+    )
+
+    $envVarName = [string]$Account.PasswordEnvVar
+    $password = Get-EnvironmentVariableValue -Name $envVarName
+    if (-not [string]::IsNullOrWhiteSpace($password)) {
+        return $password
+    }
+
+    if ($RequireSecret) {
+        throw "Test account password not provided for '$($Account.Sam)'. Set environment variable '$envVarName'."
+    }
+
+    return $null
+}
+
 function Get-ExternalConfig {
     if ($PSBoundParameters.ContainsKey('ConfigPath')) {
-        if (-not (Test-Path $ConfigPath)) {
+        if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
             throw "Config file not found: $ConfigPath"
         }
         $RunReport.ConfigSource = "file:${ConfigPath}"
-        $raw = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
+        $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
     } else {
         $RunReport.ConfigSource = 'inline-json'
         $raw = $ConfigJson
@@ -169,8 +273,7 @@ function Export-RunReportArtifacts {
     $RunReport.DurationSeconds = [math]::Round(((Get-Date) - [datetime]$RunReport.StartTime).TotalSeconds, 2)
 
     if ($RunReport.Outputs.RunReportJsonPath) {
-        New-DirectoryForFilePath -FilePath $RunReport.Outputs.RunReportJsonPath
-        $RunReport | ConvertTo-Json -Depth 30 | Set-Content -Path $RunReport.Outputs.RunReportJsonPath -Encoding UTF8
+        Set-TextFileContent -FilePath $RunReport.Outputs.RunReportJsonPath -Value ($RunReport | ConvertTo-Json -Depth 30)
     }
     if ($RunReport.Outputs.RunReportPhaseCsvPath) {
         New-DirectoryForFilePath -FilePath $RunReport.Outputs.RunReportPhaseCsvPath
@@ -252,14 +355,15 @@ $ConfigTemplate = @{
     BreakGlass = @{
         Account1    = 'brk-glass-01'
         Account2    = 'brk-glass-02'
-        TempPassword = 'ChangeMe!BrkGlass2026'  # <- CHANGE BEFORE RUNNING
+        TempPassword = ''
+        TempPasswordEnvVar = 'MEAM_BREAKGLASS_TEMP_PASSWORD'
     }
 
     # --- Feature flags ---
     EnableAuthSilos    = $true    # Requires DFL 2012R2+
     EnableSmartcard    = $true    # SmartcardLogonRequired on all zoned accounts
     EnableWindowsLAPS  = $false   # $true if Server 2022 / Win11; $false = legacy AdmPwd LAPS
-    CreateTestAccounts = $true
+    CreateTestAccounts = $false
 }
 
 $ExternalConfig = Get-ExternalConfig
@@ -335,6 +439,10 @@ function New-User {
         [string]$Desc = '', [string]$Password,
         [bool]$PwdNeverExpires = $false, [bool]$SmartcardRequired = $false
     )
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        throw "Password is required for user '$Sam'."
+    }
+
     if (-not (Get-ADUser -Filter "SamAccountName -eq '$Sam'" -ErrorAction SilentlyContinue)) {
         $p = @{
             SamAccountName=$Sam; Name="$GN $SN"; GivenName=$GN; Surname=$SN
@@ -399,7 +507,7 @@ function Set-GPOUserRight {
     } else {
         $content = $content -replace '(\[Privilege Rights\])', "`$1`r`n$Privilege = $sidStr"
     }
-    Set-Content -Path $infPath -Value $content -Encoding Unicode
+    Set-TextFileContent -FilePath $infPath -Value $content -Encoding Unicode
 
     # Increment machine GPO version
     if (Test-Path $gptIniPath) {
@@ -407,7 +515,7 @@ function Set-GPOUserRight {
         if ($ini -match 'Version=(\d+)') {
             $ver    = [int]$Matches[1]
             $newVer = ($ver -band 0xFFFF0000) -bor (($ver -band 0x0000FFFF) + 1)
-            Set-Content -Path $gptIniPath -Value ($ini -replace "Version=\d+", "Version=$newVer")
+            Set-TextFileContent -FilePath $gptIniPath -Value ($ini -replace "Version=\d+", "Version=$newVer")
         }
     }
     Write-Log "  $GPOName | $Privilege = $sidStr" OK
@@ -437,7 +545,7 @@ Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclus
 ,Account Logon,Credential Validation,{0CCE923F-69AE-11D9-BED3-505054503030},Success and Failure,,3
 ,Policy Change,Audit Policy Change,{0CCE922F-69AE-11D9-BED3-505054503030},Success and Failure,,3
 ,Privilege Use,Sensitive Privilege Use,{0CCE9228-69AE-11D9-BED3-505054503030},Success and Failure,,3
-"@ | Set-Content "$auditDir\audit.csv" -Encoding UTF8
+"@ | Set-TextFileContent -FilePath "$auditDir\audit.csv"
     Write-Log "  Audit policy -> '$GPOName'" OK
 }
 
@@ -641,11 +749,16 @@ function Assert-Config {
     if ($Cfg.DNS.Deploy -and [string]::IsNullOrWhiteSpace($Cfg.DNS.ServerName)) {
         $errors.Add('DNS.Deploy=true requires DNS.ServerName.')
     }
-    if ($Cfg.BreakGlass.TempPassword -like 'ChangeMe!*') {
-        $warnings.Add('Break-glass TempPassword appears to be a placeholder value.')
+    if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.BreakGlass.TempPassword)) {
+        if ($Cfg.BreakGlass.TempPassword -like 'ChangeMe!*') {
+            $warnings.Add('BreakGlass.TempPassword uses the example placeholder value and must be replaced before execution.')
+        }
+        else {
+            $warnings.Add('BreakGlass.TempPassword is stored in configuration as plaintext. Prefer BreakGlass.TempPasswordEnvVar.')
+        }
     }
     if ($Cfg.CreateTestAccounts) {
-        $warnings.Add('CreateTestAccounts=true will create test users with configured passwords.')
+        $warnings.Add('CreateTestAccounts=true requires per-account environment secrets for lab users. Keep disabled in production.')
     }
 
     return [pscustomobject]@{
@@ -672,7 +785,7 @@ function Export-ValidationReport {
         [pscustomobject]@{ Check = $k; Result = [string]$Report[$k] }
     }
 
-    $rows | ConvertTo-Json -Depth 4 | Set-Content -Path $jsonPath -Encoding UTF8
+    Set-TextFileContent -FilePath $jsonPath -Value ($rows | ConvertTo-Json -Depth 4)
     $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
     Write-Log "Validation report exported: $jsonPath" OK
@@ -829,12 +942,39 @@ function Invoke-PreFlightValidation {
         $Cfg.DNS.ZoneName = $Cfg.DomainFQDN
     }
 
-    if ($Cfg.BreakGlass.TempPassword -like 'ChangeMe!*') {
-        $warnings.Add('Break-glass TempPassword appears to be a default placeholder. Change it before production use.')
+    try {
+        $resolvedBreakGlassPassword = Resolve-BreakGlassPassword -Cfg $Cfg -RequireSecret
+        if ($resolvedBreakGlassPassword.Length -lt 20) {
+            $errors.Add('Break-glass password must be at least 20 characters.')
+        }
+    }
+    catch {
+        $errors.Add($_.Exception.Message)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.BreakGlass.TempPassword)) {
+        if ($Cfg.BreakGlass.TempPassword -like 'ChangeMe!*') {
+            $errors.Add('BreakGlass.TempPassword still uses the example placeholder value.')
+        }
+        else {
+            $warnings.Add('BreakGlass.TempPassword is stored in configuration as plaintext. Prefer BreakGlass.TempPasswordEnvVar.')
+        }
     }
 
     if ($Cfg.CreateTestAccounts) {
-        $warnings.Add('CreateTestAccounts is enabled; test users and passwords will be created unless disabled.')
+        foreach ($testAdmin in (Get-TestAdminDefinitions -CorpOuDn $Cfg.CorpOU -EnableSmartcard ([bool]$Cfg.EnableSmartcard))) {
+            try {
+                $testAdminPassword = Resolve-TestAccountPassword -Account $testAdmin -RequireSecret
+                if ($testAdminPassword.Length -lt 20) {
+                    $errors.Add("Test account password for '$($testAdmin.Sam)' must be at least 20 characters.")
+                }
+            }
+            catch {
+                $errors.Add($_.Exception.Message)
+            }
+        }
+
+        $warnings.Add('CreateTestAccounts is enabled; test account passwords must be supplied through environment variables.')
     }
 
     Write-Log '=== PRE-FLIGHT VALIDATION ===' INFO
@@ -1373,10 +1513,11 @@ Invoke-Phase -Name 'PHASE 10: BREAK-GLASS ACCOUNTS' -Block {
 Write-Log '=== PHASE 10: BREAK-GLASS ACCOUNTS ===' INFO
 
 $bkOU = "OU=Accounts,OU=Zone 0A,OU=Tier 0,OU=Tiers,$CorpOU"
+$breakGlassPassword = Resolve-BreakGlassPassword -Cfg $Config -RequireSecret
 foreach ($bk in @($Config.BreakGlass.Account1, $Config.BreakGlass.Account2)) {
     New-User -Sam $bk -GN 'Break' -SN 'Glass' -Path $bkOU `
         -Desc 'BREAK-GLASS: Emergency T0 account. Offline vault. Audit ALL usage.' `
-        -Password $Config.BreakGlass.TempPassword -PwdNeverExpires $true `
+        -Password $breakGlassPassword -PwdNeverExpires $true `
         -SmartcardRequired $false   # break-glass explicitly no smartcard (vault credentials)
     Set-Member -Group 'T0-ROLE-AD-Admins' -Member $bk
     Disable-ADAccount -Identity $bk
@@ -1396,30 +1537,11 @@ if ($Config.CreateTestAccounts) {
     Write-Log '=== PHASE 11: TEST ACCOUNTS + gMSAs ===' INFO
 
     # MEAM: zoned admin accounts with smartcard enforcement
-    $testAdmins = @(
-        @{ Sam='adm-t0-test01'; GN='Test'; SN='T0Admin01';
-           Path="OU=Accounts,OU=Zone 0A,OU=Tier 0,OU=Tiers,$CorpOU";
-           Desc='TEST: Tier 0 / Zone 0A admin'; Groups=@('T0-ROLE-AD-Admins','PAW-T0-Users')
-           Pwd='T0@dmin!MEAM2026'; Smartcard=$Config.EnableSmartcard }
-
-        @{ Sam='adm-t1-srv01'; GN='Test'; SN='T1SrvAdmin01';
-           Path="OU=Accounts,OU=Zone 1B,OU=Tier 1,OU=Tiers,$CorpOU";
-           Desc='TEST: Tier 1 / Zone 1B server admin'; Groups=@('T1-ROLE-Server-Admins','PAW-T1-Users')
-           Pwd='T1Srv!MEAM2026'; Smartcard=$Config.EnableSmartcard }
-
-        @{ Sam='adm-t1-dns01'; GN='Test'; SN='T1DnsAdmin01';
-           Path="OU=Accounts,OU=Zone 1C,OU=Tier 1,OU=Tiers,$CorpOU";
-           Desc='TEST: Tier 1 / Zone 1C DNS admin'; Groups=@('T1-ROLE-DNS-Admins','PAW-T1-Users')
-           Pwd='T1Dns!MEAM2026'; Smartcard=$Config.EnableSmartcard }
-
-        @{ Sam='adm-t2-hd01'; GN='Test'; SN='T2HelpDesk01';
-           Path="OU=Accounts,OU=Zone 2A,OU=Tier 2,OU=Tiers,$CorpOU";
-           Desc='TEST: Tier 2 / Zone 2A helpdesk'; Groups=@('T2-ROLE-HelpDesk','PAW-T2-Users')
-           Pwd='T2HD!MEAM2026'; Smartcard=$false }   # T2 helpdesk: smartcard optional
-    )
+    $testAdmins = Get-TestAdminDefinitions -CorpOuDn $CorpOU -EnableSmartcard ([bool]$Config.EnableSmartcard)
     foreach ($a in $testAdmins) {
+        $testAdminPassword = Resolve-TestAccountPassword -Account $a -RequireSecret
         New-User -Sam $a.Sam -GN $a.GN -SN $a.SN -Path $a.Path -Desc $a.Desc `
-            -Password $a.Pwd -SmartcardRequired $a.Smartcard
+            -Password $testAdminPassword -SmartcardRequired $a.Smartcard
         foreach ($g in $a.Groups) { Set-Member -Group $g -Member $a.Sam }
     }
 
