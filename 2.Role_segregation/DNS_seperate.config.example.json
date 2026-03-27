@@ -1,0 +1,26 @@
+{
+  "resolverServer": "dns01.contoso.com",
+  "domainFqdn": "contoso.com",
+  "domainControllerIPs": [
+    "10.0.0.10",
+    "10.0.0.11"
+  ],
+  "upstreamResolvers": [
+    "1.1.1.1",
+    "9.9.9.9"
+  ],
+  "forceConvertAuthoritativeZone": false,
+  "configureDhcp": true,
+  "dhcpServer": "dhcp01.contoso.com",
+  "dhcpScopeIds": [
+    "10.10.10.0",
+    "10.10.20.0"
+  ],
+  "autoApprove": false,
+  "outputs": {
+    "baselineJsonPath": "C:\\MEAM\\DNS-Baseline.json",
+    "changePlanPath": "C:\\MEAM\\DNS-ChangePlan.txt",
+    "runReportJsonPath": "C:\\MEAM\\DNS-RunReport.json",
+    "runReportPhaseCsvPath": "C:\\MEAM\\DNS-RunReport-Phases.csv"
+  }
+}

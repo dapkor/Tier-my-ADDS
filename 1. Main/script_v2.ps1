@@ -31,16 +31,165 @@
 #Requires -RunAsAdministrator
 
 param(
-    [switch]$ValidateOnly
+    [Parameter(Mandatory, ParameterSetName='ConfigFile')]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigPath,
+
+    [Parameter(Mandatory, ParameterSetName='ConfigInline')]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigJson,
+
+    [switch]$ValidateOnly,
+    [switch]$ContinueOnPhaseError,
+    [switch]$LintConfigOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+trap {
+    try {
+        if ($_ -and $_.Exception) {
+            $RunReport.Errors += $_.Exception.Message
+        }
+        Export-RunReportArtifacts -Status 'Failed'
+    }
+    catch {
+    }
+    throw
+}
+
+$RunReport = [ordered]@{
+    StartTime = (Get-Date).ToString('o')
+    EndTime = $null
+    DurationSeconds = 0
+    ConfigSource = $null
+    Status = 'InProgress'
+    Phases = @()
+    Warnings = @()
+    Errors = @()
+    Outputs = [ordered]@{
+        RunReportJsonPath = $null
+        RunReportPhaseCsvPath = $null
+    }
+}
+
+function ConvertTo-HashtableDeep {
+    param([Parameter(Mandatory)]$InputObject)
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $ht = @{}
+        foreach ($k in $InputObject.Keys) {
+            $ht[$k] = ConvertTo-HashtableDeep -InputObject $InputObject[$k]
+        }
+        return $ht
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) {
+        $arr = @()
+        foreach ($item in $InputObject) {
+            $arr += ,(ConvertTo-HashtableDeep -InputObject $item)
+        }
+        return $arr
+    }
+
+    if ($InputObject.PSObject -and $InputObject.PSObject.Properties.Count -gt 0) {
+        $ht = @{}
+        foreach ($prop in $InputObject.PSObject.Properties) {
+            $ht[$prop.Name] = ConvertTo-HashtableDeep -InputObject $prop.Value
+        }
+        return $ht
+    }
+
+    return $InputObject
+}
+
+function Merge-HashtableDeep {
+    param(
+        [Parameter(Mandatory)][hashtable]$Base,
+        [Parameter(Mandatory)][hashtable]$Override
+    )
+
+    $merged = @{}
+
+    foreach ($k in $Base.Keys) {
+        $merged[$k] = $Base[$k]
+    }
+
+    foreach ($k in $Override.Keys) {
+        if ($merged.ContainsKey($k) -and $merged[$k] -is [hashtable] -and $Override[$k] -is [hashtable]) {
+            $merged[$k] = Merge-HashtableDeep -Base $merged[$k] -Override $Override[$k]
+        }
+        else {
+            $merged[$k] = $Override[$k]
+        }
+    }
+
+    return $merged
+}
+
+function New-DirectoryForFilePath {
+    param([Parameter(Mandatory)][string]$FilePath)
+    $dir = Split-Path -Parent $FilePath
+    if ($dir -and -not (Test-Path $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Get-ExternalConfig {
+    if ($PSBoundParameters.ContainsKey('ConfigPath')) {
+        if (-not (Test-Path $ConfigPath)) {
+            throw "Config file not found: $ConfigPath"
+        }
+        $RunReport.ConfigSource = "file:${ConfigPath}"
+        $raw = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
+    } else {
+        $RunReport.ConfigSource = 'inline-json'
+        $raw = $ConfigJson
+    }
+
+    try {
+        $obj = $raw | ConvertFrom-Json -Depth 30
+        return ConvertTo-HashtableDeep -InputObject $obj
+    }
+    catch {
+        throw "Invalid JSON configuration: $($_.Exception.Message)"
+    }
+}
+
+function Export-RunReportArtifacts {
+    param([string]$Status = 'Completed')
+
+    $RunReport.Status = $Status
+    $RunReport.EndTime = (Get-Date).ToString('o')
+    $RunReport.DurationSeconds = [math]::Round(((Get-Date) - [datetime]$RunReport.StartTime).TotalSeconds, 2)
+
+    if ($RunReport.Outputs.RunReportJsonPath) {
+        New-DirectoryForFilePath -FilePath $RunReport.Outputs.RunReportJsonPath
+        $RunReport | ConvertTo-Json -Depth 30 | Set-Content -Path $RunReport.Outputs.RunReportJsonPath -Encoding UTF8
+    }
+    if ($RunReport.Outputs.RunReportPhaseCsvPath) {
+        New-DirectoryForFilePath -FilePath $RunReport.Outputs.RunReportPhaseCsvPath
+        $RunReport.Phases |
+            Select-Object Name, Status, DurationSeconds, StartTime, EndTime, Error |
+            Export-Csv -Path $RunReport.Outputs.RunReportPhaseCsvPath -NoTypeInformation -Encoding UTF8
+    }
+}
+
 # ============================================================
 #region 0. CONFIGURATION  ← REVIEW BEFORE RUNNING
 # ============================================================
-$Config = @{
+$ConfigTemplate = @{
+
+    # --- Run/report outputs ---
+    RunReportJsonPath        = ''
+    RunReportPhaseCsvPath    = ''
+    ComplianceReportOutputDirectory = '.'
+    DnsTier1Group            = 'T1-ROLE-DNS-Admins'
 
     # --- Domain (auto-detected in pre-flight) ---
     DomainDN   = $null
@@ -113,6 +262,23 @@ $Config = @{
     CreateTestAccounts = $true
 }
 
+$ExternalConfig = Get-ExternalConfig
+$Config = Merge-HashtableDeep -Base $ConfigTemplate -Override $ExternalConfig
+
+if ($Config.ContainsKey('RunReportJsonPath') -and -not [string]::IsNullOrWhiteSpace([string]$Config.RunReportJsonPath)) {
+    $RunReport.Outputs.RunReportJsonPath = [string]$Config.RunReportJsonPath
+}
+else {
+    $RunReport.Outputs.RunReportJsonPath = ".\MEAM-RunReport-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+}
+
+if ($Config.ContainsKey('RunReportPhaseCsvPath') -and -not [string]::IsNullOrWhiteSpace([string]$Config.RunReportPhaseCsvPath)) {
+    $RunReport.Outputs.RunReportPhaseCsvPath = [string]$Config.RunReportPhaseCsvPath
+}
+else {
+    $RunReport.Outputs.RunReportPhaseCsvPath = ".\MEAM-RunReport-$(Get-Date -Format 'yyyyMMdd-HHmmss')-phases.csv"
+}
+
 #endregion
 
 # ============================================================
@@ -123,6 +289,8 @@ function Write-Log {
     param([string]$Message, [ValidateSet('INFO','WARN','ERROR','OK')]$Level = 'INFO')
     $c = @{ INFO='Cyan'; WARN='Yellow'; ERROR='Red'; OK='Green' }
     Write-Host "[$(Get-Date -f 'HH:mm:ss')][$Level] $Message" -ForegroundColor $c[$Level]
+    if ($Level -eq 'WARN') { $RunReport.Warnings += $Message }
+    if ($Level -eq 'ERROR') { $RunReport.Errors += $Message }
 }
 
 function Test-OU {
@@ -336,10 +504,19 @@ function Set-LAPSGPO {
 function Invoke-Phase {
     param(
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][scriptblock]$Block
+        [Parameter(Mandatory)][scriptblock]$Block,
+        [switch]$ContinueOnError
     )
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $phase = [ordered]@{
+        Name = $Name
+        StartTime = (Get-Date).ToString('o')
+        EndTime = $null
+        DurationSeconds = 0
+        Status = 'Succeeded'
+        Error = $null
+    }
     Write-Log "=== PHASE START: $Name ===" INFO
     try {
         & $Block
@@ -348,8 +525,19 @@ function Invoke-Phase {
     }
     catch {
         $sw.Stop()
+        $phase.Status = 'Failed'
+        $phase.Error = $_.Exception.Message
+        $RunReport.Errors += $_.Exception.Message
         Write-Log "=== PHASE FAILED: $Name ($($sw.Elapsed.ToString())) ===" ERROR
-        throw
+        if (-not $ContinueOnError) {
+            throw
+        }
+        Write-Log "Continuing after non-fatal phase failure: $Name" WARN
+    }
+    finally {
+        $phase.EndTime = (Get-Date).ToString('o')
+        $phase.DurationSeconds = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+        $RunReport.Phases += [pscustomobject]$phase
     }
 }
 
@@ -669,6 +857,23 @@ function Invoke-PreFlightValidation {
 # Run pre-flight before deriving deployment paths and before making changes.
 Invoke-Phase -Name 'PRE-FLIGHT VALIDATION' -Block {
     Invoke-PreFlightValidation -Cfg $Config -ValidateOnlyMode:$ValidateOnly
+} -ContinueOnError:$ContinueOnPhaseError
+
+if ($LintConfigOnly) {
+    Invoke-Phase -Name 'CONFIG LINT' -Block {
+        $cfgValidation = Assert-Config -Cfg $Config
+        foreach ($w in $cfgValidation.Warnings) { Write-Log $w WARN }
+        if ($cfgValidation.Errors.Count -gt 0) {
+            foreach ($e in $cfgValidation.Errors) { Write-Log $e ERROR }
+            throw "Config lint failed with $($cfgValidation.Errors.Count) error(s)."
+        }
+        Write-Log 'Configuration lint passed.' OK
+    } -ContinueOnError:$false
+
+    Export-RunReportArtifacts -Status 'LintPassed'
+    Write-Host "Run report JSON: $($RunReport.Outputs.RunReportJsonPath)"
+    Write-Host "Run phases CSV:  $($RunReport.Outputs.RunReportPhaseCsvPath)"
+    return
 }
 
 # Shorthand (resolved after pre-flight populates domain values)
@@ -676,8 +881,14 @@ $DomainDN   = $Config.DomainDN
 $DomainFQDN = $Config.DomainFQDN
 $CorpOU     = "OU=$($Config.CorpOU),$DomainDN"
 
-if ($ValidateOnly) { return }
+if ($ValidateOnly) {
+    Export-RunReportArtifacts -Status 'ValidateOnly'
+    return
+}
 
+Invoke-Phase -Name 'MAIN DEPLOYMENT' -Block {
+
+Invoke-Phase -Name 'PHASE 2: OU HIERARCHY' -Block {
 # ============================================================
 #region 2. OU HIERARCHY – MEAM ZONE/SERVICE STRUCTURE
 # ============================================================
@@ -740,7 +951,9 @@ foreach ($sub in @('Security','Distribution','Resource')) {
 Write-Log '=== OU HIERARCHY COMPLETE ===' OK
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 3: SECURITY GROUPS' -Block {
 # ============================================================
 #region 3. SECURITY GROUPS – MEAM NAMING CONVENTION
 # ============================================================
@@ -832,7 +1045,9 @@ foreach ($zoneKey in @('0A','0B','1A','1B','1C','1D','2A','2B')) {
 Write-Log '=== SECURITY GROUPS COMPLETE ===' OK
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 4: GROUP NESTING' -Block {
 # ============================================================
 #region 4. GROUP NESTING (Role groups -> Built-ins; clean built-ins)
 # ============================================================
@@ -875,7 +1090,9 @@ foreach ($grp in $sensitiveBuiltIns) {
 Write-Log '=== GROUP NESTING COMPLETE ===' OK
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 5: PSOS' -Block {
 # ============================================================
 #region 5. FINE-GRAINED PASSWORD POLICIES
 # ============================================================
@@ -919,7 +1136,9 @@ foreach ($key in @('T0','T1','T2','SA')) {
 Write-Log '=== PSOs COMPLETE ===' OK
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 6: PROTECTED USERS' -Block {
 # ============================================================
 #region 6. PROTECTED USERS
 # ============================================================
@@ -942,7 +1161,9 @@ foreach ($g in $protectedGroups) {
 Write-Log '=== PROTECTED USERS COMPLETE ===' OK
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 7: AUTH POLICIES + SILOS' -Block {
 # ============================================================
 #region 7. MEAM AUTHENTICATION POLICIES + SILOS (PAW + Zone)
 # ============================================================
@@ -1027,7 +1248,9 @@ POST-SILO MANUAL STEPS:
 }
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 8: GPOS' -Block {
 # ============================================================
 #region 8. GPOs – CREATE / LINK / CONFIGURE
 # ============================================================
@@ -1098,7 +1321,9 @@ Set-CredentialGuardGPO 'GPO-T2-CredentialGuard'
 Write-Log '=== GPOs COMPLETE ===' OK
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 9: ACL DELEGATIONS' -Block {
 # ============================================================
 #region 9. ACL DELEGATIONS (MEAM delegation groups)
 # ============================================================
@@ -1139,7 +1364,9 @@ if (Get-ADGroup -Filter "Name -eq 'Z2A-DLG-Workstations-Users-Read'" -ErrorActio
 Write-Log '=== ACL DELEGATIONS COMPLETE ===' OK
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 10: BREAK-GLASS ACCOUNTS' -Block {
 # ============================================================
 #region 10. BREAK-GLASS ACCOUNTS
 # ============================================================
@@ -1159,7 +1386,9 @@ foreach ($bk in @($Config.BreakGlass.Account1, $Config.BreakGlass.Account2)) {
 Write-Log '=== BREAK-GLASS COMPLETE ===' OK
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 11: TEST ACCOUNTS + GMSAS' -Block {
 # ============================================================
 #region 11. TEST ADMIN ACCOUNTS + gMSAs (MEAM)
 # ============================================================
@@ -1211,7 +1440,9 @@ if ($Config.CreateTestAccounts) {
 }
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 12: DNS TIER 1 DELEGATION' -Block {
 # ============================================================
 #region 12. DNS TIER 1 DELEGATION (Zone 1C)
 # ============================================================
@@ -1267,12 +1498,14 @@ if ($Config.DNS.Deploy -and $Config.DNS.ServerName) {
     Add-DnsTierDelegation `
         -DnsServerName           $Config.DNS.ServerName `
         -ZoneName                $Config.DNS.ZoneName `
-        -Tier1Group              'T1-ROLE-DNS-Admins' `
+        -Tier1Group              $Config.DnsTier1Group `
         -ConfigureDCsAsSecondary $Config.DNS.ConfigDCsAsSecondary
 }
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
 
+Invoke-Phase -Name 'PHASE 13: VALIDATION + COMPLIANCE REPORT' -Block {
 # ============================================================
 #region 13. VALIDATION + COMPLIANCE REPORT
 # ============================================================
@@ -1360,7 +1593,7 @@ foreach ($key in $report.Keys) {
 }
 Write-Host "========================================`n" -ForegroundColor Cyan
 
-$reportOutput = Export-ValidationReport -Report $report -OutputDirectory '.'
+$reportOutput = Export-ValidationReport -Report $report -OutputDirectory $Config.ComplianceReportOutputDirectory
 Write-Log "Compliance artifacts: JSON=$($reportOutput.JsonPath) | CSV=$($reportOutput.CsvPath)" INFO
 
 Write-Log @"
@@ -1382,3 +1615,12 @@ POST-DEPLOYMENT CHECKLIST (manual steps):
 "@ INFO
 
 #endregion
+} -ContinueOnError:$ContinueOnPhaseError
+
+} -ContinueOnError:$ContinueOnPhaseError
+
+$failedPhase = @($RunReport.Phases | Where-Object { $_.Status -eq 'Failed' }).Count -gt 0
+$finalStatus = if ($failedPhase -or $RunReport.Errors.Count -gt 0) { 'CompletedWithErrors' } else { 'Completed' }
+Export-RunReportArtifacts -Status $finalStatus
+Write-Host "Run report JSON: $($RunReport.Outputs.RunReportJsonPath)"
+Write-Host "Run phases CSV:  $($RunReport.Outputs.RunReportPhaseCsvPath)"
