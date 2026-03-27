@@ -1,5 +1,6 @@
 # MEAM – Active Directory Tier Architecture
 
+> **Author:** [@dapkor](https://github.com/dapkor)  
 > **Monash Enterprise Access Model (MEAM)** extended with Microsoft Enterprise Access Model (EAM),  
 > Kerberos Authentication Policies, Clean Source Principle, VMware vCenter & Nutanix RBAC integration.
 
@@ -19,9 +20,11 @@
 11. [GPO Matrix](#gpo-matrix)
 12. [PSO Matrix](#pso-matrix)
 13. [Monitoring: Auto-Tiering Scanner](#monitoring-auto-tiering-scanner)
-14. [Platform Integrations](#platform-integrations)
-15. [Operational Runbook](#operational-runbook)
-16. [References](#references)
+14. [Monthly HTML Tier Reports](#monthly-html-tier-reports)
+15. [CI/CD Pipeline Setup](#cicd-pipeline-setup)
+16. [Platform Integrations](#platform-integrations)
+17. [Operational Runbook](#operational-runbook)
+18. [References](#references)
 
 ---
 
@@ -45,8 +48,15 @@ as the object being secured. The model enforces this through two independent, co
 | Script | Purpose |
 |---|---|
 | `1. Main/script_v2.ps1` | Full greenfield MEAM deployment (OUs, groups, PSOs, Auth Policies/Silos, GPOs, ACL delegation, break-glass/test accounts, DNS delegation, compliance report). |
+| `1. Main/script_v2.config.example.json` | Ready-to-run JSON config for `script_v2.ps1`. Copy, fill in your domain values, run. |
 | `2.Role_segregation/DNS_seperate.ps1` | DNS role segregation helper (repository utility script). |
-| `3. Monitoring/Auto-Tiering Computer account scanner.ps1` | Tier placement monitoring for computer objects, with CSV output and optional alerting. |
+| `3. Monitoring/Auto-Tiering Computer account scanner.ps1` | Tier placement monitoring for computer objects — scoring engine, CSV output, optional email alert. |
+| `3. Monitoring/MEAM-Tier-Report.ps1` | **Monthly HTML compliance report** — T0 & T1 accounts, groups, PSOs, Auth Silos, PAWs, break-glass. Designed for scheduled CI/CD pipeline runs. |
+| `3. Monitoring/MEAM-Tier-Report.config.example.json` | Example config for the HTML report script. |
+| `flowchart TD.presentation.txt` | Stakeholder-friendly Mermaid diagram (presentation view) with simplified labels and clean control narratives. |
+| `flowchart TD.executive.txt` | Executive one-slide Mermaid diagram focused on business outcomes, governance cadence, and risk reduction. |
+| `.github/workflows/meam-monthly-report.yml` | GitHub Actions workflow — runs the HTML report on the 1st of each month. |
+| `azure-pipelines-monthly-report.yml` | Azure DevOps pipeline — same monthly schedule, publishes artifact. |
 
 ---
 
@@ -287,31 +297,147 @@ Script: `3. Monitoring/Auto-Tiering Computer account scanner.ps1`
 ### Purpose
 
 - Scans AD computer objects and detects likely tier-placement mismatches based on naming patterns and OU path patterns.
+- Scoring engine with configurable weights per signal type (OU, name, group, SPN, OS, events, recent moves).
 - Exports findings to CSV and can send an email alert when violations are found.
+- Detects high-risk moves (e.g. Tier 0 → Tier 1 lateral movement) via Security event ID 5139.
 
 ### Parameters
 
-- `DomainDN`: defaults to `(Get-ADDomain).DistinguishedName`
-- `ReportPath`: defaults to `C:\MEAM\TierScan-YYYYMMDD.csv`
-- `AlertTo`: email recipient for alert message
+- `-ConfigPath` / `-ConfigJson`: JSON config file or inline JSON (required)
+- `-FailOnPhaseError`: abort on phase failure instead of continuing
+- `-LintConfigOnly`: validate config schema without querying AD
 
-### Current behavior and scope
+### Configuration keys (required)
 
-- Scans computer objects only (users/service accounts are not yet included)
-- Uses regex-based tier inference from computer names
-- Produces remediation suggestions (`Move-ADObject` example)
-- Auto-fix logic is intentionally commented out by default
+| Key | Description |
+|---|---|
+| `corpOU` | Top-level OU name (e.g. `"Corp"`) |
+| `reportPath` | Output CSV path for findings |
+| `runReportPath` | Output JSON path for run report |
+| `zoneOUs` | OU path patterns per tier (`Tier 0`, `Tier 1`, `Tier 2`) |
+| `tierSignals` | Name/group/description/SPN patterns per tier |
+| `targetOUByTier` | Target OU DNs for remediation suggestions |
+| `weights` | Scoring weights per signal type |
+| `signals` | Feature flags (useRoleSignals, useEventSignals, etc.) |
+| `alert` | Email alert config (`enabled`, `to`, `from`, `smtpServer`) |
 
 ### Prerequisites
 
-- PowerShell `ActiveDirectory` module
-- SMTP connectivity for alerting (`Send-MailMessage` currently used)
+- PowerShell `ActiveDirectory` module (RSAT)
+- Read-only domain account (Domain Users is sufficient)
+- SMTP connectivity for alerting (optional)
 
-### Recommended hardening follow-ups
+---
 
-- Replace `Send-MailMessage` with a modern mail/API approach
-- Add explicit `-WhatIf`/`-Confirm` support before enabling any auto-move logic
-- Expand scanner coverage to user/service accounts and zone-specific rules
+## Monthly HTML Tier Reports
+
+Script: `3. Monitoring/MEAM-Tier-Report.ps1`
+
+Generates a **fully self-contained HTML report** — no external dependencies, single file, open in any browser.  
+Designed to run monthly via CI/CD pipeline and be published as a pipeline artifact or emailed to security staff.
+
+### What the report covers
+
+| Section | Contents |
+|---|---|
+| **KPI summary cards** | T0/T1 account counts, stale accounts, failures, warnings, auth silos, PAW device count |
+| **Compliance checks** | PASS / WARN / FAIL per check with detail — PSOs, Protected Users, smartcard, Domain Admins hygiene, silos, break-glass |
+| **Tier 0 accounts** | Enabled/stale/smartcard/Protected-Users status per account, role groups, PAW devices, break-glass accounts, GPO links |
+| **Tier 1 accounts** | Same as above for T1 — accounts, role groups, GPO links |
+| **PSO cards** | All fine-grained password policies with every setting visible |
+| **Authentication silos** | All silos and enforcement status |
+| **Domain hygiene** | Direct user members in Domain Admins, Protected Users membership |
+
+### Usage
+
+```powershell
+# Copy and edit the example config
+Copy-Item "3. Monitoring\MEAM-Tier-Report.config.example.json" `
+          "3. Monitoring\MEAM-Tier-Report.config.json"
+
+# Run locally (opens in browser)
+.\3. Monitoring\MEAM-Tier-Report.ps1 `
+    -ConfigPath .\3. Monitoring\MEAM-Tier-Report.config.json `
+    -OpenInBrowser
+
+# Run without opening browser (for pipeline use)
+.\3. Monitoring\MEAM-Tier-Report.ps1 `
+    -ConfigPath .\3. Monitoring\MEAM-Tier-Report.config.json `
+    -OutputPath .\reports\MEAM-$(Get-Date -f yyyyMM).html
+```
+
+### Runner / agent requirements
+
+> ⚠️ These requirements apply both to manual runs and to CI/CD pipeline runners.
+
+| Requirement | Detail |
+|---|---|
+| **Domain-joined machine** | The executing host must be domain-joined **or** have direct LDAP access (TCP 389 / 636) to a DC. The script uses Kerberos — a TGT is required. **Do NOT run on a Domain Controller.** Recommended host: Tier 1 member server (Zone 1B or 1C). |
+| **RSAT — ActiveDirectory module** | Mandatory. `Install-WindowsFeature RSAT-AD-PowerShell` (Server) or `Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0` (Win 10/11) |
+| **RSAT — GroupPolicy module** | Optional. Enables the GPO links table in the report. `Install-WindowsFeature GPMC` |
+| **Service account** | **Domain Users only — no admin rights required.** All AD reads use default Domain Users permissions. Recommended: create a dedicated account `svc-meam-report` with no interactive logon rights and no tier-role group membership. |
+| **Network** | Port 389/636 open to at least one DC from the runner host. |
+
+### Stale account threshold
+
+Pass `-StaleThresholdDays` (default: `90`) to control when an account is flagged as stale.  
+Any enabled account with no logon in that many days is highlighted in the report with a warning badge.
+
+---
+
+## CI/CD Pipeline Setup
+
+Both pipeline files use the same self-hosted runner/agent with the requirements above.  
+Neither pipeline requires secrets beyond the config JSON and optional SMTP credentials.
+
+### GitHub Actions — `.github/workflows/meam-monthly-report.yml`
+
+| Setting | Value |
+|---|---|
+| **Schedule** | 1st of each month at 07:00 UTC |
+| **Runner label** | `ad-access` (must match your self-hosted runner label) |
+| **Config source** | Secret `MEAM_REPORT_CONFIG_JSON` **or** committed `3. Monitoring\MEAM-Tier-Report.config.json` |
+| **Artifact retention** | 90 days |
+| **Email** | Uncomment `Email report` step; set `SMTP_SERVER`, `SMTP_FROM`, `SMTP_TO` secrets |
+
+**Quick setup:**
+```
+1. Register a self-hosted Windows runner on a Tier 1 server
+   → GitHub repo → Settings → Actions → Runners → New self-hosted runner
+   → Use the label "ad-access"
+
+2. Install RSAT on that server:
+   Install-WindowsFeature RSAT-AD-PowerShell, GPMC
+
+3. Configure the runner service to run as svc-meam-report
+
+4. Add secret MEAM_REPORT_CONFIG_JSON (JSON content of your config)
+   → GitHub repo → Settings → Secrets and variables → Actions → New repository secret
+```
+
+### Azure DevOps — `azure-pipelines-monthly-report.yml`
+
+| Setting | Value |
+|---|---|
+| **Schedule** | 1st of each month at 07:00 UTC |
+| **Agent pool** | `MEAM-Agents` (update `name:` field to match your pool) |
+| **Config source** | Pipeline variable `MEAM_REPORT_CONFIG_JSON` (mark as secret) **or** committed config file |
+| **Artifact** | Published as `MEAM-TierReport-<BuildId>` pipeline artifact |
+| **Email** | Uncomment `Email report` task; add `SMTP_SERVER`, `SMTP_FROM`, `SMTP_TO` to variable group `meam-report-config` |
+
+**Quick setup:**
+```
+1. Register a self-hosted Windows agent on a Tier 1 server
+   → Azure DevOps → Project Settings → Agent pools → New agent
+
+2. Install RSAT on that server:
+   Install-WindowsFeature RSAT-AD-PowerShell, GPMC
+
+3. Configure the agent service to run as svc-meam-report
+
+4. Create a pipeline variable MEAM_REPORT_CONFIG_JSON (secret)
+   → Pipeline → Edit → Variables → New variable → Mark as secret
+```
 
 ---
 

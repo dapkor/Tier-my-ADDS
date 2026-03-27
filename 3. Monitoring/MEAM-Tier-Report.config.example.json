@@ -1,0 +1,34 @@
+{
+  "_comment": "MEAM-Tier-Report.ps1 configuration. Same CorpOU/PSO/BreakGlass/Zones schema as script_v2.",
+
+  "CorpOU": "Corp",
+
+  "PSO": {
+    "T0": { "Name": "PSO-Tier0" },
+    "T1": { "Name": "PSO-Tier1" },
+    "T2": { "Name": "PSO-Tier2" },
+    "SA": { "Name": "PSO-SvcAccts" }
+  },
+
+  "BreakGlass": {
+    "Account1": "brk-glass-01",
+    "Account2": "brk-glass-02"
+  },
+
+  "Zones": {
+    "T0": {
+      "0A": "Domain Management",
+      "0B": "Hypervisor Management"
+    },
+    "T1": {
+      "1A": "Workstation Management",
+      "1B": "Server Management",
+      "1C": "DNS Management",
+      "1D": "Storage Management"
+    },
+    "T2": {
+      "2A": "Workstations",
+      "2B": "Servers"
+    }
+  }
+}

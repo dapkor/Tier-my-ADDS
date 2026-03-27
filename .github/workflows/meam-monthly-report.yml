@@ -1,0 +1,197 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MEAM Monthly Tier Compliance Report — GitHub Actions Workflow
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# REQUIREMENTS — this workflow MUST run on a self-hosted Windows runner that:
+#   1. IS DOMAIN-JOINED (or has direct LDAP access, port 389/636, to a DC)
+#      The runner uses Kerberos. It must be able to obtain a TGT for your domain.
+#      Recommended host: a Tier 1 member server (Zone 1B or 1C).
+#      DO NOT use a Domain Controller as runner host.
+#
+#   2. HAS RSAT — ActiveDirectory PowerShell module
+#      Windows Server:
+#        Install-WindowsFeature RSAT-AD-PowerShell
+#      Windows 10/11:
+#        Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
+#
+#   3. HAS RSAT — GroupPolicy module (optional — enables GPO link tables in report)
+#      Windows Server:
+#        Install-WindowsFeature GPMC
+#      Windows 10/11:
+#        Add-WindowsCapability -Online -Name Rsat.GroupPolicy.Management.Tools~~~~0.0.1.0
+#
+#   4. RUNS AS A LOW-PRIVILEGE SERVICE ACCOUNT — domain read-only is sufficient
+#      Recommended: svc-meam-report (member of Domain Users only)
+#      Required permissions (all granted to Domain Users by default):
+#        • Read on all AD objects (OUs, users, groups, computers, PSOs, silos)
+#        • No admin rights. No tier-0 or tier-1 role group membership.
+#        • No interactive logon rights on the runner host is fine
+#          (runner service logon is sufficient)
+#
+# SETUP STEPS:
+#   1. Register a GitHub Actions self-hosted runner on your T1 admin server:
+#        https://github.com/<org>/<repo>/settings/actions/runners/new
+#        Use Windows runner with the label "ad-access"
+#   2. Copy "3. Monitoring/MEAM-Tier-Report.config.json" to the runner host
+#      (or commit it to the repo — it contains no secrets if passwords are removed)
+#   3. Create a GitHub secret MEAM_REPORT_CONFIG_JSON with the full JSON content
+#      if you prefer not to commit the config file.
+#   4. Set REPORT_RECIPIENTS secret to a comma-separated email list if email is needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: MEAM Monthly Tier Report
+
+on:
+  # Run at 07:00 UTC on the 1st of every month
+  schedule:
+    - cron: '0 7 1 * *'
+
+  # Allow manual run from the Actions tab (useful for testing)
+  workflow_dispatch:
+    inputs:
+      stale_days:
+        description: 'Stale account threshold (days)'
+        required: false
+        default: '90'
+      open_report:
+        description: 'Upload report as artifact'
+        required: false
+        default: 'true'
+        type: boolean
+
+env:
+  REPORT_DIR: reports
+  STALE_DAYS: ${{ github.event.inputs.stale_days || '90' }}
+
+jobs:
+  generate-report:
+    name: Generate MEAM HTML Tier Report
+    # ── Must match the label(s) on your domain-joined self-hosted runner ──────
+    runs-on: [self-hosted, Windows, ad-access]
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Verify AD module ───────────────────────────────────────────────
+      - name: Verify ActiveDirectory module
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+            Write-Error 'ActiveDirectory PowerShell module is not installed on this runner.'
+            Write-Error 'Install RSAT: Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0'
+            exit 1
+          }
+          Write-Host 'ActiveDirectory module OK' -ForegroundColor Green
+          $dc = (Get-ADDomain).PDCEmulator
+          Write-Host "PDC Emulator: $dc" -ForegroundColor Cyan
+
+      # ── 3. Resolve config path ────────────────────────────────────────────
+      #    Priority: secret MEAM_REPORT_CONFIG_JSON > committed config file
+      - name: Resolve configuration
+        id: config
+        shell: pwsh
+        env:
+          CONFIG_JSON: ${{ secrets.MEAM_REPORT_CONFIG_JSON }}
+        run: |
+          $reportDate  = Get-Date -Format 'yyyyMM'
+          $reportName  = "MEAM-TierReport-$reportDate.html"
+          $reportPath  = Join-Path "${{ env.REPORT_DIR }}" $reportName
+          New-Item -Path "${{ env.REPORT_DIR }}" -ItemType Directory -Force | Out-Null
+
+          if (-not [string]::IsNullOrWhiteSpace($env:CONFIG_JSON)) {
+            Write-Host 'Using config from MEAM_REPORT_CONFIG_JSON secret'
+            echo "CONFIG_MODE=inline" >> $env:GITHUB_OUTPUT
+          } elseif (Test-Path '3. Monitoring\MEAM-Tier-Report.config.json') {
+            Write-Host 'Using committed config file'
+            echo "CONFIG_MODE=file" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Error 'No config found. Provide MEAM_REPORT_CONFIG_JSON secret or commit 3. Monitoring\MEAM-Tier-Report.config.json'
+            exit 1
+          }
+
+          echo "REPORT_PATH=$reportPath"   >> $env:GITHUB_OUTPUT
+          echo "REPORT_NAME=$reportName"   >> $env:GITHUB_OUTPUT
+
+      # ── 4. Generate the HTML report ───────────────────────────────────────
+      - name: Generate HTML report
+        shell: pwsh
+        env:
+          CONFIG_JSON: ${{ secrets.MEAM_REPORT_CONFIG_JSON }}
+        run: |
+          $params = @{
+            OutputPath        = '${{ steps.config.outputs.REPORT_PATH }}'
+            StaleThresholdDays = [int]'${{ env.STALE_DAYS }}'
+          }
+
+          if ('${{ steps.config.outputs.CONFIG_MODE }}' -eq 'inline') {
+            $params.ConfigJson = $env:CONFIG_JSON
+          } else {
+            $params.ConfigPath = '3. Monitoring\MEAM-Tier-Report.config.json'
+          }
+
+          $result = & '3. Monitoring\MEAM-Tier-Report.ps1' @params
+          Write-Host "Report status : $($result.OverallStatus)"
+          Write-Host "T0 accounts   : $($result.T0UserCount)"
+          Write-Host "T1 accounts   : $($result.T1UserCount)"
+          Write-Host "Failures      : $($result.Failures)"
+          Write-Host "Warnings      : $($result.Warnings)"
+          Write-Host "Stale total   : $($result.StaleTotal)"
+
+          # Surface compliance status to pipeline summary
+          $icon = switch ($result.OverallStatus) {
+            'PASS' { ':white_check_mark:' }
+            'WARN' { ':warning:' }
+            default { ':x:' }
+          }
+
+          $summary = @"
+          ## $icon MEAM Tier Report — $($result.Domain)
+          | | |
+          |---|---|
+          | **Overall status** | **$($result.OverallStatus)** |
+          | T0 accounts | $($result.T0UserCount) |
+          | T1 accounts | $($result.T1UserCount) |
+          | Failures | $($result.Failures) |
+          | Warnings | $($result.Warnings) |
+          | Stale accounts | $($result.StaleTotal) |
+          "@
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          # Fail the job if there are hard failures (optional — remove if you prefer always-green)
+          if ($result.Failures -gt 0) {
+            Write-Warning "Report has $($result.Failures) compliance failure(s). Review the artifact."
+          }
+
+      # ── 5. Upload HTML report as artifact ────────────────────────────────
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MEAM-TierReport-${{ github.run_id }}
+          path: ${{ steps.config.outputs.REPORT_PATH }}
+          retention-days: 90
+          if-no-files-found: error
+
+      # ── 6. (Optional) Email the report ───────────────────────────────────
+      #    Requires SMTP credentials as secrets: SMTP_SERVER, SMTP_FROM, SMTP_TO
+      #    Uncomment and fill in the secrets if you want email delivery.
+      #
+      # - name: Email report
+      #   shell: pwsh
+      #   env:
+      #     SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+      #     SMTP_FROM:   ${{ secrets.SMTP_FROM }}
+      #     SMTP_TO:     ${{ secrets.SMTP_TO }}
+      #   run: |
+      #     $reportFile = '${{ steps.config.outputs.REPORT_PATH }}'
+      #     if (-not (Test-Path $reportFile)) { Write-Warning 'Report file not found, skipping email.'; return }
+      #     Send-MailMessage `
+      #       -SmtpServer $env:SMTP_SERVER `
+      #       -From       $env:SMTP_FROM `
+      #       -To         ($env:SMTP_TO -split ',') `
+      #       -Subject    "MEAM Monthly Tier Report — $(Get-Date -Format 'MMMM yyyy')" `
+      #       -Body       "Please find the MEAM Tier Compliance Report attached." `
+      #       -Attachments $reportFile `
+      #       -Priority   Normal
+      #     Write-Host 'Email sent.' -ForegroundColor Green

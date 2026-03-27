@@ -1,0 +1,190 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MEAM Monthly Tier Compliance Report — Azure DevOps Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# REQUIREMENTS — this pipeline MUST run on a self-hosted Windows agent that:
+#   1. IS DOMAIN-JOINED (or has direct LDAP access, port 389/636, to a DC)
+#      The agent uses Kerberos. It must be able to obtain a TGT for your domain.
+#      Recommended host: a Tier 1 member server (Zone 1B or 1C).
+#      DO NOT use a Domain Controller as the agent host.
+#
+#   2. HAS RSAT — ActiveDirectory PowerShell module
+#      Windows Server:
+#        Install-WindowsFeature RSAT-AD-PowerShell
+#      Windows 10/11:
+#        Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
+#
+#   3. HAS RSAT — GroupPolicy module (optional — enables GPO link tables in report)
+#      Windows Server:
+#        Install-WindowsFeature GPMC
+#      Windows 10/11:
+#        Add-WindowsCapability -Online -Name Rsat.GroupPolicy.Management.Tools~~~~0.0.1.0
+#
+#   4. RUNS AS A LOW-PRIVILEGE SERVICE ACCOUNT — domain read-only is sufficient
+#      Recommended: svc-meam-report (member of Domain Users only)
+#      Required permissions (all granted to Domain Users by default):
+#        • Read on all AD objects (OUs, users, groups, computers, PSOs, silos)
+#        • No admin rights. No tier-0 or tier-1 role group membership.
+#        • The agent service can run as svc-meam-report; it does NOT need
+#          to be a local admin on the agent host.
+#
+# SETUP STEPS:
+#   1. Register an Azure DevOps self-hosted agent on your T1 admin server.
+#      Use an agent pool named "MEAM-Agents" (or update the 'name' field below).
+#        https://learn.microsoft.com/en-us/azure/devops/pipelines/agents/windows-agent
+#   2. Create a Variable Group named "meam-report-config" in your Azure DevOps project
+#      with the following (optional) variables:
+#        SMTP_SERVER  — your SMTP relay
+#        SMTP_FROM    — sender address
+#        SMTP_TO      — recipient address(es), comma-separated
+#      Mark sensitive variables as secret.
+#   3. Either commit "3. Monitoring/MEAM-Tier-Report.config.json" to the repo
+#      OR create a pipeline variable MEAM_REPORT_CONFIG_JSON with the JSON content
+#      and mark it as secret.
+# ─────────────────────────────────────────────────────────────────────────────
+
+trigger: none   # Do not run on code pushes
+
+schedules:
+  - cron: '0 7 1 * *'          # 07:00 UTC on the 1st of every month
+    displayName: Monthly MEAM Tier Compliance Report
+    branches:
+      include:
+        - main
+    always: true                # Run even when there are no code changes
+
+# ── Optional: load variable group with SMTP credentials ──────────────────────
+# variables:
+#   - group: meam-report-config
+
+variables:
+  STALE_DAYS: 90
+  REPORT_DIR: $(Build.ArtifactStagingDirectory)\reports
+
+pool:
+  # ── Change this to the name of your self-hosted AD-accessible agent pool ──
+  name: MEAM-Agents
+  demands:
+    - Agent.OS -equals Windows_NT
+
+stages:
+  - stage: GenerateReport
+    displayName: Generate MEAM Tier Report
+    jobs:
+      - job: TierReport
+        displayName: Build HTML Compliance Report
+        timeoutInMinutes: 30
+
+        steps:
+          # ── 1. Verify AD module ─────────────────────────────────────────
+          - task: PowerShell@2
+            displayName: Verify ActiveDirectory module
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+                  Write-Error 'ActiveDirectory module not installed.'
+                  Write-Error 'Install: Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0'
+                  exit 1
+                }
+                $dc = (Get-ADDomain).PDCEmulator
+                Write-Host "##[section]ActiveDirectory module OK. PDC: $dc"
+
+          # ── 2. Create output directory ──────────────────────────────────
+          - task: PowerShell@2
+            displayName: Prepare output directory
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                New-Item -Path '$(REPORT_DIR)' -ItemType Directory -Force | Out-Null
+                Write-Host "Report directory: $(REPORT_DIR)"
+
+          # ── 3. Generate HTML report (config from file) ──────────────────
+          #    Uses the committed config file. Swap to the inline step below
+          #    if you prefer to inject config via pipeline secret variable.
+          - task: PowerShell@2
+            displayName: Generate HTML report
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                $reportDate = Get-Date -Format 'yyyyMM'
+                $reportName = "MEAM-TierReport-$reportDate.html"
+                $reportPath = Join-Path '$(REPORT_DIR)' $reportName
+
+                $params = @{
+                  OutputPath         = $reportPath
+                  StaleThresholdDays = [int]'$(STALE_DAYS)'
+                }
+
+                # Use secret pipeline variable if set; otherwise fall back to committed file
+                $inlineConfig = '$(MEAM_REPORT_CONFIG_JSON)'   # set as secret pipeline variable
+                if (-not [string]::IsNullOrWhiteSpace($inlineConfig) -and $inlineConfig -ne '$(MEAM_REPORT_CONFIG_JSON)') {
+                  $params.ConfigJson = $inlineConfig
+                  Write-Host '##[section]Using MEAM_REPORT_CONFIG_JSON pipeline variable'
+                } elseif (Test-Path '3. Monitoring\MEAM-Tier-Report.config.json') {
+                  $params.ConfigPath = '3. Monitoring\MEAM-Tier-Report.config.json'
+                  Write-Host '##[section]Using committed config file'
+                } else {
+                  Write-Error 'No config found. Provide MEAM_REPORT_CONFIG_JSON variable or commit the config file.'
+                  exit 1
+                }
+
+                $result = & '3. Monitoring\MEAM-Tier-Report.ps1' @params
+
+                # Surface to pipeline log
+                Write-Host "##[section]Report Summary"
+                Write-Host "  Overall Status : $($result.OverallStatus)"
+                Write-Host "  Domain         : $($result.Domain)"
+                Write-Host "  T0 accounts    : $($result.T0UserCount)"
+                Write-Host "  T1 accounts    : $($result.T1UserCount)"
+                Write-Host "  Failures       : $($result.Failures)"
+                Write-Host "  Warnings       : $($result.Warnings)"
+                Write-Host "  Stale Total    : $($result.StaleTotal)"
+                Write-Host "  Report file    : $reportPath"
+
+                # Expose report path as variable for subsequent steps
+                Write-Host "##vso[task.setvariable variable=generatedReportPath]$reportPath"
+                Write-Host "##vso[task.setvariable variable=reportOverallStatus]$($result.OverallStatus)"
+                Write-Host "##vso[task.setvariable variable=reportFailures]$($result.Failures)"
+
+                # Add warning badge to pipeline when compliance issues exist
+                if ($result.Failures -gt 0) {
+                  Write-Host "##vso[task.logissue type=warning]MEAM report has $($result.Failures) compliance failure(s). Review the artifact."
+                }
+
+          # ── 4. Publish HTML as pipeline artifact ────────────────────────
+          - task: PublishPipelineArtifact@1
+            displayName: Publish report artifact
+            inputs:
+              targetPath: $(REPORT_DIR)
+              artifact: MEAM-TierReport-$(Build.BuildId)
+              publishLocation: pipeline
+
+          # ── 5. (Optional) Email the report ──────────────────────────────
+          #    Uncomment and set SMTP_SERVER / SMTP_FROM / SMTP_TO variables
+          #    in the "meam-report-config" variable group (or as pipeline variables).
+          #
+          # - task: PowerShell@2
+          #   displayName: Email report
+          #   condition: and(succeeded(), ne(variables['SMTP_SERVER'], ''))
+          #   inputs:
+          #     targetType: inline
+          #     pwsh: true
+          #     script: |
+          #       $reportFile = '$(generatedReportPath)'
+          #       if (-not (Test-Path $reportFile)) {
+          #         Write-Warning 'Report file not found, skipping email.'
+          #         return
+          #       }
+          #       Send-MailMessage `
+          #         -SmtpServer '$(SMTP_SERVER)' `
+          #         -From       '$(SMTP_FROM)' `
+          #         -To         ('$(SMTP_TO)' -split ',') `
+          #         -Subject    "MEAM Monthly Tier Report — $(Get-Date -Format 'MMMM yyyy')" `
+          #         -Body       "MEAM Tier Compliance Report for $(Get-Date -Format 'MMMM yyyy').`n`nOverall status: $(reportOverallStatus)`nSee attached HTML report." `
+          #         -Attachments $reportFile `
+          #         -Priority   Normal
+          #       Write-Host 'Email sent.' -ForegroundColor Green
