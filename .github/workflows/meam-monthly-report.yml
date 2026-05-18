@@ -108,11 +108,11 @@ jobs:
           if (-not [string]::IsNullOrWhiteSpace($env:CONFIG_JSON)) {
             Write-Host 'Using config from MEAM_REPORT_CONFIG_JSON secret'
             echo "CONFIG_MODE=inline" >> $env:GITHUB_OUTPUT
-          } elseif (Test-Path '3. Monitoring\MEAM-Tier-Report.config.json') {
+          } elseif (Test-Path '3-Monitoring/New-MEAM-Compliance-Report.config.example.json') {
             Write-Host 'Using committed config file'
             echo "CONFIG_MODE=file" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Error 'No config found. Provide MEAM_REPORT_CONFIG_JSON secret or commit 3. Monitoring\MEAM-Tier-Report.config.json'
+            Write-Error 'No config found. Provide MEAM_REPORT_CONFIG_JSON secret or commit 3-Monitoring/New-MEAM-Compliance-Report.config.example.json'
             exit 1
           }
 

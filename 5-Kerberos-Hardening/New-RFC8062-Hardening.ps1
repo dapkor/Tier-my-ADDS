@@ -174,7 +174,8 @@ function Add-PhaseResult {
         Timestamp = (Get-Date).ToString('o')
     }
     
-    Write-Log "$PhaseName: $Status - $Detail" -Level $(if ($Status -eq 'FAIL') { 'ERROR' } else { 'OK' })
+    $logLevel = if ($Status -eq 'FAIL') { 'ERROR' } elseif ($Status -eq 'WARN') { 'WARN' } else { 'OK' }
+    Write-Log "$PhaseName - $Status - $Detail" -Level $logLevel
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,7 +228,6 @@ if ($Phase -in @('All','DCRegistry')) {
     else {
         try {
             $dcs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
-            $dcrComputers = $null
             
             # Batch DC registry updates
             Write-Log "Updating registry on $($dcs.Count) DC(s)" -Level INFO
