@@ -1,0 +1,79 @@
+{
+  "domainDN": "DC=contoso,DC=com",
+  "corpOU": "Corp",
+  "reportPath": "C:\\MEAM\\TierScan-20260327.csv",
+  "runReportPath": "C:\\MEAM\\TierScan-RunReport-20260327.json",
+  "runReportPhaseCsvPath": "C:\\MEAM\\TierScan-RunReport-Phases-20260327.csv",
+  "includeUnclassified": true,
+  "zoneOUs": {
+    "Tier 0": "*OU=Zone 0*,OU=Tier 0*",
+    "Tier 1": "*OU=Zone 1*,OU=Tier 1*",
+    "Tier 2": "*OU=Zone 2*,OU=Tier 2*"
+  },
+  "tierSignals": {
+    "Tier 0": {
+      "NamePatterns": ["^DC\\d+$", "PKI|ADCS|ADFS", "^Hypervisor|^VMHost|^ESX"],
+      "GroupPatterns": ["Domain Controllers", "Tier 0", "T0-", "PKI", "Hypervisor"],
+      "DescriptionPatterns": ["tier\\s*0", "domain controller", "pki", "adcs"],
+      "SpnPatterns": ["ldap/", "gc/", "kadmin/", "dns/"]
+    },
+    "Tier 1": {
+      "NamePatterns": ["^SCCM", "^Intune", "^Server\\d+$", "^DNS\\d+$", "^NAS|^SAN|^Storage"],
+      "GroupPatterns": ["Tier 1", "T1-", "DNS", "SCCM", "Intune", "Server"],
+      "DescriptionPatterns": ["tier\\s*1", "management", "dns", "sccm", "intune"],
+      "SpnPatterns": ["mssqlsvc/", "http/", "cifs/", "dns/"]
+    },
+    "Tier 2": {
+      "NamePatterns": ["^WS\\d+$", "^Workstation", "^Kiosk", "^VDI"],
+      "GroupPatterns": ["Tier 2", "T2-", "Workstation", "Kiosk", "Client"],
+      "DescriptionPatterns": ["tier\\s*2", "workstation", "kiosk", "endpoint"],
+      "SpnPatterns": []
+    }
+  },
+  "targetOUByTier": {
+    "Tier 0": "OU=Computers,OU=Zone 0A,OU=Tier 0,OU=Tiers,OU=Corp,DC=contoso,DC=com",
+    "Tier 1": "OU=Computers,OU=Zone 1B,OU=Tier 1,OU=Tiers,OU=Corp,DC=contoso,DC=com",
+    "Tier 2": "OU=Computers,OU=Zone 2A,OU=Tier 2,OU=Tiers,OU=Corp,DC=contoso,DC=com"
+  },
+  "weights": {
+    "OU": 35,
+    "Name": 15,
+    "Group": 25,
+    "Description": 10,
+    "SPN": 8,
+    "DomainController": 100,
+    "DomainControllersOU": 80,
+    "ServerOS": 8,
+    "WorkstationOS": 10,
+    "ServiceStrong": 45,
+    "ServiceMedium": 20,
+    "EventStrong": 25,
+    "EventMedium": 12
+  },
+  "signals": {
+    "useRoleSignals": true,
+    "useEventSignals": true,
+    "eventLookbackHours": 24,
+    "eventMaxPerCheck": 1,
+    "useMoveSignals": true,
+    "moveLookbackDays": 7,
+    "moveEventServer": "",
+    "moveEventMax": 5000
+  },
+  "queryTuning": {
+    "retryCount": 2,
+    "retryDelaySeconds": 2,
+    "cimOperationTimeoutSeconds": 15,
+    "eventQueryTimeoutSeconds": 20
+  },
+  "alert": {
+    "enabled": false,
+    "mode": "webhook",
+    "webhookUrlEnvVar": "MEAM_SCANNER_WEBHOOK_URL",
+    "authorizationEnvVar": "MEAM_SCANNER_WEBHOOK_AUTHORIZATION",
+    "timeoutSeconds": 30,
+    "headers": {
+      "X-Source": "meam-auto-tiering-scanner"
+    }
+  }
+}
