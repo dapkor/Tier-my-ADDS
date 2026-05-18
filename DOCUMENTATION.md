@@ -64,6 +64,21 @@ Then: [5. Kerberos Hardening/RFC8062-Implementation-Guide.md](./5.%20Kerberos%20
 - CI/CD pipeline configuration
 - Webhook alerting
 
+### I Need to Roll Out Tiering Safely in an Existing Domain
+👉 Start with: [BOOTSTRAP-AND-MIGRATION.md](./docs/BOOTSTRAP-AND-MIGRATION.md)
+- Bootstrap from existing privileged access
+- Avoid Tier 0 chicken-and-egg failures
+- Pilot-first migration sequence
+- Tier 1 hybrid sync guidance
+
+Then read the SOPs:
+- [TIER-0-SOP.md](./docs/TIER-0-SOP.md)
+- [TIER-1-SOP.md](./docs/TIER-1-SOP.md)
+- [TIER-2-SOP.md](./docs/TIER-2-SOP.md)
+
+Validation gate:
+- [VALIDATION-CHECKLIST.md](./docs/VALIDATION-CHECKLIST.md)
+
 ### I Need References & Security Standards
 👉 Read: [REFERENCES.md](./docs/REFERENCES.md)
 - Academic papers
@@ -85,6 +100,11 @@ Then: [5. Kerberos Hardening/RFC8062-Implementation-Guide.md](./5.%20Kerberos%20
 | [MONITORING.md](./docs/MONITORING.md) | Monitoring & reporting | DevOps, analysts |
 | [TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md) | Issue resolution | Support teams |
 | [REFERENCES.md](./docs/REFERENCES.md) | External resources | Researchers, auditors |
+| [BOOTSTRAP-AND-MIGRATION.md](./docs/BOOTSTRAP-AND-MIGRATION.md) | Existing-domain rollout path | Architects, implementers |
+| [TIER-0-SOP.md](./docs/TIER-0-SOP.md) | Tier 0 operating procedure | Tier 0 admins |
+| [TIER-1-SOP.md](./docs/TIER-1-SOP.md) | Tier 1 operating procedure | Tier 1 admins |
+| [TIER-2-SOP.md](./docs/TIER-2-SOP.md) | Tier 2 operating procedure | Tier 2 admins |
+| [VALIDATION-CHECKLIST.md](./docs/VALIDATION-CHECKLIST.md) | Go/no-go validation gates | Operators, reviewers |
 
 ### Kerberos Hardening (RFC 8062)
 

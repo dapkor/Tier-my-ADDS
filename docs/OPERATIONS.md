@@ -2,6 +2,15 @@
 
 **Day-to-day administrative procedures for managing MEAM infrastructure**
 
+**Related SOPs:**
+- [Bootstrap and Migration Guide](BOOTSTRAP-AND-MIGRATION.md)
+- [Tier 0 SOP](TIER-0-SOP.md)
+- [Tier 1 SOP](TIER-1-SOP.md)
+- [Tier 2 SOP](TIER-2-SOP.md)
+- [Validation Checklist](VALIDATION-CHECKLIST.md)
+
+If you are introducing the tier model into an existing domain, start with the bootstrap guide first. If Tier 1 accounts are hybrid, follow the Tier 1 SOP for the Entra sync boundary and keep Tier 0 on-premises only.
+
 ---
 
 ## Table of Contents

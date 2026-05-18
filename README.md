@@ -11,6 +11,9 @@ All project folders have been reorganized with proper PowerShell naming conventi
 ### 🚀 Get Started
 - **New to MEAM?** → Start with ARCHITECTURE.md
 - **Ready to deploy?** → Go to 1-Deployment/README.md
+- **Rolling out to an existing domain?** → Start with docs/BOOTSTRAP-AND-MIGRATION.md
+- **Need operating procedures?** → Read docs/TIER-0-SOP.md, docs/TIER-1-SOP.md, docs/TIER-2-SOP.md
+- **Need validation gates?** → Use docs/VALIDATION-CHECKLIST.md
 - **Troubleshooting?** → Check TROUBLESHOOTING.md
 - **Operations guide?** → See OPERATIONS.md
 
@@ -25,6 +28,13 @@ Tier-my-ADDS/
 │  ├─ MONITORING.md (compliance & monitoring)
 │  ├─ TROUBLESHOOTING.md (common issues & solutions)
 │  └─ REFERENCES.md (RFC links, tools, resources)
+│
+├─ 📘 docs/ (Tier rollout and SOPs)
+│  ├─ BOOTSTRAP-AND-MIGRATION.md (existing-domain rollout)
+│  ├─ TIER-0-SOP.md (Tier 0 operating procedure)
+│  ├─ TIER-1-SOP.md (Tier 1 operating procedure + hybrid sync)
+│  ├─ TIER-2-SOP.md (Tier 2 operating procedure)
+│  └─ VALIDATION-CHECKLIST.md (go/no-go gates)
 │
 ├─ 🔧 1-Deployment/ (MEAM Deployment)
 │  ├─ New-MEAM-Deployment.ps1 (main script)
