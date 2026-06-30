@@ -1,0 +1,157 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Tier-my-ADDS — Lab Infrastructure
+# Brownfield Active Directory environment for MEAM tiering testing
+#
+# PREREQUISITES
+#   Vagrant >= 2.3          https://developer.hashicorp.com/vagrant/downloads
+#   VirtualBox >= 7.0       https://www.virtualbox.org/              (Intel Mac / Windows / Linux)
+#   VMware Fusion 13+ FREE  https://www.vmware.com/products/fusion    (Apple Silicon Mac — recommended)
+#     vagrant plugin install vagrant-vmware-desktop
+#
+# QUICK START
+#   vagrant up dc01          # Provision primary DC first (~15 min)
+#   vagrant up dc02          # Provision secondary DC  (~10 min)
+#   vagrant up member01      # Provision member server  (~10 min)
+#
+# VM INVENTORY
+#   dc01      192.168.56.10   Primary DC / PDC Emulator (4 GB RAM)
+#   dc02      192.168.56.11   Secondary DC              (2 GB RAM)
+#   member01  192.168.56.20   Member server / test target (2 GB RAM)
+#
+# CREDENTIALS
+#   Domain:   contoso.local  (CONTOSO)
+#   Admin:    CONTOSO\Administrator  /  P@ssw0rd!Contoso2024
+#   DSRM:     P@ssw0rd!DSRM2024
+#   Vagrant:  vagrant / vagrant
+
+VAGRANTFILE_API_VERSION = "2"
+
+# ── Box selection ─────────────────────────────────────────────────────────────
+# gusztavvargadr boxes include VirtualBox Guest Additions and are actively maintained.
+# For Apple Silicon use the vmware_desktop provider instead.
+WINDOWS_BOX         = "gusztavvargadr/windows-server-2022-standard"
+WINDOWS_BOX_VERSION = ">= 2202.0.2404"
+
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+
+  config.vm.box         = WINDOWS_BOX
+  config.vm.box_version = WINDOWS_BOX_VERSION
+
+  # WinRM communication
+  config.vm.communicator   = "winrm"
+  config.winrm.username    = "vagrant"
+  config.winrm.password    = "vagrant"
+  config.winrm.timeout     = 600
+  config.winrm.retry_limit = 30
+  config.winrm.retry_delay = 10
+
+  # Upload scripts once per VM; each VM runs only the scripts it needs
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  # ── DC01 — Primary Domain Controller ───────────────────────────────────────
+  config.vm.define "dc01", primary: true do |dc01|
+    dc01.vm.hostname = "DC01"
+    dc01.vm.network "private_network", ip: "192.168.56.10"
+
+    dc01.vm.provider "virtualbox" do |vb|
+      vb.name   = "MEAM-Lab-DC01"
+      vb.memory = 4096
+      vb.cpus   = 2
+      vb.gui    = false
+      vb.customize ["modifyvm", :id, "--nested-hw-virt", "on"]
+      vb.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
+    end
+
+    dc01.vm.provider "vmware_desktop" do |vmw|
+      vmw.vmx["displayName"] = "MEAM-Lab-DC01"
+      vmw.vmx["memsize"]     = "4096"
+      vmw.vmx["numvcpus"]    = "2"
+      # vhv.enable omitted — nested-virt flag is x86-only; not used on Apple Silicon
+    end
+
+    # Upload bootstrap scripts
+    dc01.vm.provision "upload-bootstrap", type: "file",
+      source: "bootstrap/", destination: "C:/vagrant-bootstrap/"
+    dc01.vm.provision "upload-config", type: "file",
+      source: "config/lab.json", destination: "C:/vagrant-bootstrap/lab.json"
+
+    # Phase 1 – Install ADDS and promote (triggers reboot)
+    dc01.vm.provision "promote-dc", type: "shell", reboot: true,
+      path: "bootstrap/01-Promote-DomainController.ps1"
+
+    # Phase 2 – Post-promotion domain init (may reboot for GP updates)
+    dc01.vm.provision "init-domain", type: "shell", reboot: true,
+      path: "bootstrap/02-Initialize-Domain.ps1"
+
+    # Phase 3 – Create brownfield AD objects (users / groups / computers)
+    dc01.vm.provision "brownfield-objects", type: "shell",
+      path: "bootstrap/03-New-BrownfieldObjects.ps1"
+
+    # Phase 4 – Apply realistic security misconfigurations
+    dc01.vm.provision "brownfield-misconfig", type: "shell",
+      path: "bootstrap/04-Apply-BrownfieldMisconfig.ps1"
+  end
+
+  # ── DC02 — Secondary Domain Controller ─────────────────────────────────────
+  # Start AFTER dc01 is fully provisioned.
+  config.vm.define "dc02" do |dc02|
+    dc02.vm.hostname = "DC02"
+    dc02.vm.network "private_network", ip: "192.168.56.11"
+
+    dc02.vm.provider "virtualbox" do |vb|
+      vb.name   = "MEAM-Lab-DC02"
+      vb.memory = 2048
+      vb.cpus   = 2
+      vb.gui    = false
+      vb.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
+    end
+
+    dc02.vm.provider "vmware_desktop" do |vmw|
+      vmw.vmx["displayName"] = "MEAM-Lab-DC02"
+      vmw.vmx["memsize"]     = "2048"
+      vmw.vmx["numvcpus"]    = "2"
+    end
+
+    dc02.vm.provision "upload-bootstrap", type: "file",
+      source: "bootstrap/", destination: "C:/vagrant-bootstrap/"
+    dc02.vm.provision "upload-config", type: "file",
+      source: "config/lab.json", destination: "C:/vagrant-bootstrap/lab.json"
+
+    # Promote as secondary DC in existing forest (triggers reboot)
+    dc02.vm.provision "promote-secondary-dc", type: "shell", reboot: true,
+      path: "bootstrap/05-Promote-SecondaryDC.ps1"
+  end
+
+  # ── MEMBER01 — Member Server (MEAM deployment & test target) ───────────────
+  # Start AFTER dc01 is fully provisioned.
+  config.vm.define "member01" do |member01|
+    member01.vm.hostname = "MEMBER01"
+    member01.vm.network "private_network", ip: "192.168.56.20"
+
+    member01.vm.provider "virtualbox" do |vb|
+      vb.name   = "MEAM-Lab-MEMBER01"
+      vb.memory = 2048
+      vb.cpus   = 2
+      vb.gui    = false
+      vb.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
+    end
+
+    member01.vm.provider "vmware_desktop" do |vmw|
+      vmw.vmx["displayName"] = "MEAM-Lab-MEMBER01"
+      vmw.vmx["memsize"]     = "2048"
+      vmw.vmx["numvcpus"]    = "2"
+    end
+
+    member01.vm.provision "upload-bootstrap", type: "file",
+      source: "bootstrap/", destination: "C:/vagrant-bootstrap/"
+    member01.vm.provision "upload-config", type: "file",
+      source: "config/lab.json", destination: "C:/vagrant-bootstrap/lab.json"
+
+    # Join domain (triggers reboot)
+    member01.vm.provision "join-domain", type: "shell", reboot: true,
+      path: "bootstrap/06-Join-MemberDomain.ps1"
+  end
+
+end

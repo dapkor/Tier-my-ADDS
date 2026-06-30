@@ -1,0 +1,67 @@
+{
+  "_comment": "LAB-ONLY config. Do NOT use in production. Credentials are plaintext by design for the Vagrant lab.",
+
+  "DomainFQDN":    "contoso.local",
+  "DomainNetBIOS": "CONTOSO",
+  "DSRMPassword":  "P@ssw0rd!DSRM2024",
+  "AdminPassword": "P@ssw0rd!Contoso2024",
+
+  "CorpOU": "Corp",
+
+  "Zones": {
+    "T0": {
+      "0A": "Domain Management",
+      "0B": "Hypervisor Management"
+    },
+    "T1": {
+      "1A": "Workstation Management",
+      "1B": "Server Management",
+      "1C": "DNS Management",
+      "1D": "Storage Management"
+    },
+    "T2": {
+      "2A": "Workstations",
+      "2B": "Servers"
+    }
+  },
+
+  "ZoneServices": {
+    "0A": ["DomainControllers", "PKI", "ADFS"],
+    "0B": ["Hypervisors"],
+    "1A": ["SCCM", "Intune", "AssetManagement"],
+    "1B": ["AppServers", "FileServers", "BackupServers"],
+    "1C": ["DNS"],
+    "1D": ["NAS", "SAN"],
+    "2A": ["Workstations", "Kiosks"],
+    "2B": ["BusinessServers"]
+  },
+
+  "PSO": {
+    "T0": { "Name": "PSO-Tier0",    "Precedence": 1, "MinLength": 20, "MaxAge": 180, "MinAge": 1, "History": 24, "LockoutThreshold": 0, "LockoutDuration": 0,  "ObservationWindow": 0  },
+    "T1": { "Name": "PSO-Tier1",    "Precedence": 2, "MinLength": 14, "MaxAge": 180, "MinAge": 1, "History": 24, "LockoutThreshold": 5, "LockoutDuration": 30, "ObservationWindow": 30 },
+    "T2": { "Name": "PSO-Tier2",    "Precedence": 3, "MinLength": 12, "MaxAge": 180, "MinAge": 1, "History": 12, "LockoutThreshold": 5, "LockoutDuration": 30, "ObservationWindow": 30 },
+    "SA": { "Name": "PSO-SvcAccts", "Precedence": 4, "MinLength": 30, "MaxAge": 365, "MinAge": 1, "History": 24, "LockoutThreshold": 0, "LockoutDuration": 0,  "ObservationWindow": 0  }
+  },
+
+  "DNS": {
+    "Deploy":               false,
+    "ServerName":           "DC01.contoso.local",
+    "ZoneName":             "",
+    "ConfigDCsAsSecondary": false
+  },
+
+  "BreakGlass": {
+    "Account1":    "brk-glass-01",
+    "Account2":    "brk-glass-02",
+    "TempPassword": "B!gBr3@kGl@ss!L@b2024!"
+  },
+
+  "EnableAuthSilos":   true,
+  "EnableSmartcard":   false,
+  "EnableWindowsLAPS": true,
+  "CreateTestAccounts": false,
+
+  "RunReportJsonPath":              "C:\\vagrant-bootstrap\\reports\\MEAM-RunReport.json",
+  "RunReportPhaseCsvPath":          "C:\\vagrant-bootstrap\\reports\\MEAM-RunReport-phases.csv",
+  "ComplianceReportOutputDirectory": "C:\\vagrant-bootstrap\\reports"
+}
