@@ -32,12 +32,13 @@ VAGRANTFILE_API_VERSION = "2"
 # gusztavvargadr boxes include VirtualBox Guest Additions and are actively maintained.
 # For Apple Silicon use the vmware_desktop provider instead.
 WINDOWS_BOX         = "gusztavvargadr/windows-server-2022-standard"
-WINDOWS_BOX_VERSION = ">= 2202.0.2404"
+WINDOWS_BOX_VERSION = ">= 2509.0.0"   # 2509+ have vmware_desktop provider; older builds are virtualbox-only
 
 Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
 
-  config.vm.box         = WINDOWS_BOX
-  config.vm.box_version = WINDOWS_BOX_VERSION
+  config.vm.box              = WINDOWS_BOX
+  config.vm.box_version      = WINDOWS_BOX_VERSION
+  config.vm.box_architecture = "amd64"   # vmware_desktop builds are amd64-only; Fusion emulates on Apple Silicon
 
   # WinRM communication
   config.vm.communicator   = "winrm"
