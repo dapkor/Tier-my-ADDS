@@ -1,0 +1,5 @@
+.encoding = "UTF-8"
+cloneOf0 = "/Users/dapkor/.vagrant.d/boxes/gusztavvargadr-VAGRANTSLASH-windows-server-2022-standard/2601.0.0/amd64/vmware_desktop/windows-server-2022-standard-260201-175857.vmx"
+numCloneOf = "1"
+sentinel0 = "disk-cl2.vmdk"
+numSentinels = "1"

@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<Foundry>
+<VM>
+<ClientMetaData>
+<clientMetaDataAttributes/>
+<HistoryEventList/></ClientMetaData>
+<VMId type="string">52 4e 50 dd e4 7a ae e7-4b 22 b3 fb 2d b9 b5 51</VMId>
+<vmxPathName type="string">windows-server-2022-standard-260201-175857.vmx</vmxPathName></VM></Foundry>
